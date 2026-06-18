@@ -25,6 +25,16 @@ const MAX_FILE_SIZE_MB = Number.isFinite(parsedMaxFileSize) && parsedMaxFileSize
   : 200;
 const MAX_FILE_SIZE_BYTES = Math.floor(MAX_FILE_SIZE_MB * 1024 * 1024);
 const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.trim() || '';
+const AUTO_CLEANUP_ENABLED = /^true$/i.test(process.env.AUTO_CLEANUP_ENABLED || 'false');
+const parsedCleanupDays = Number.parseFloat(process.env.AUTO_CLEANUP_DAYS || '30');
+const AUTO_CLEANUP_DAYS = Number.isFinite(parsedCleanupDays) && parsedCleanupDays > 0
+  ? parsedCleanupDays
+  : 30;
+const parsedCleanupInterval = Number.parseFloat(process.env.AUTO_CLEANUP_INTERVAL_HOURS || '12');
+const AUTO_CLEANUP_INTERVAL_HOURS = Number.isFinite(parsedCleanupInterval) && parsedCleanupInterval > 0
+  ? parsedCleanupInterval
+  : 12;
 
 function resolveProjectPath(configuredPath, fallback) {
   const value = configuredPath || fallback;
@@ -54,6 +64,20 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_files_uploaded_at
     ON files (uploaded_at DESC);
+  CREATE TABLE IF NOT EXISTS share_links (
+    id TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    max_downloads INTEGER,
+    download_count INTEGER NOT NULL DEFAULT 0,
+    revoked_at TEXT,
+    FOREIGN KEY (file_id) REFERENCES files(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_share_links_token ON share_links(token);
+  CREATE INDEX IF NOT EXISTS idx_share_links_file_id ON share_links(file_id);
+  CREATE INDEX IF NOT EXISTS idx_share_links_expires_at ON share_links(expires_at);
 `);
 
 function warnAboutToken(name, value, defaultValue) {
@@ -143,6 +167,12 @@ const listActiveFiles = db.prepare(`
   WHERE deleted_at IS NULL
   ORDER BY uploaded_at DESC
 `);
+const listFilesOlderThan = db.prepare(`
+  SELECT ${activeFileColumns}
+  FROM files
+  WHERE deleted_at IS NULL AND uploaded_at < ?
+  ORDER BY uploaded_at ASC
+`);
 const insertFile = db.prepare(`
   INSERT INTO files (
     id, stored_name, original_name, size, mime_type, sha256, uploaded_at
@@ -155,11 +185,93 @@ const incrementDownloadCount = db.prepare(`
   SET download_count = download_count + 1
   WHERE id = ? AND deleted_at IS NULL
 `);
+const decrementDownloadCount = db.prepare(`
+  UPDATE files
+  SET download_count = MAX(download_count - 1, 0)
+  WHERE id = ? AND deleted_at IS NULL
+`);
 const softDeleteFile = db.prepare(`
   UPDATE files
   SET deleted_at = ?
   WHERE id = ? AND deleted_at IS NULL
 `);
+const revokeShare = db.prepare(`
+  UPDATE share_links
+  SET revoked_at = ?
+  WHERE id = ? AND revoked_at IS NULL
+`);
+const revokeSharesByFile = db.prepare(`
+  UPDATE share_links
+  SET revoked_at = ?
+  WHERE file_id = ? AND revoked_at IS NULL
+`);
+const softDeleteFileAndShares = db.transaction((deletedAt, fileId) => {
+  softDeleteFile.run(deletedAt, fileId);
+  revokeSharesByFile.run(deletedAt, fileId);
+});
+const insertShare = db.prepare(`
+  INSERT INTO share_links (
+    id, file_id, token, created_at, expires_at, max_downloads
+  ) VALUES (
+    @id, @fileId, @token, @createdAt, @expiresAt, @maxDownloads
+  )
+`);
+const listActiveSharesByFile = db.prepare(`
+  SELECT
+    id,
+    file_id AS fileId,
+    token,
+    created_at AS createdAt,
+    expires_at AS expiresAt,
+    max_downloads AS maxDownloads,
+    download_count AS downloadCount,
+    revoked_at AS revokedAt
+  FROM share_links
+  WHERE file_id = ? AND revoked_at IS NULL
+  ORDER BY created_at DESC
+`);
+const getShareByToken = db.prepare(`
+  SELECT
+    share_links.id,
+    share_links.file_id AS fileId,
+    share_links.token,
+    share_links.created_at AS createdAt,
+    share_links.expires_at AS expiresAt,
+    share_links.max_downloads AS maxDownloads,
+    share_links.download_count AS downloadCount,
+    share_links.revoked_at AS revokedAt,
+    files.stored_name AS storedName,
+    files.original_name AS originalName,
+    files.size,
+    files.mime_type AS mimeType,
+    files.deleted_at AS fileDeletedAt
+  FROM share_links
+  JOIN files ON files.id = share_links.file_id
+  WHERE share_links.token = ?
+`);
+const incrementShareDownload = db.prepare(`
+  UPDATE share_links
+  SET download_count = download_count + 1
+  WHERE id = ?
+`);
+const decrementShareDownload = db.prepare(`
+  UPDATE share_links
+  SET download_count = MAX(download_count - 1, 0)
+  WHERE id = ?
+`);
+const claimShareDownload = db.transaction((token) => {
+  const share = getShareByToken.get(token);
+  const availability = shareAvailability(share);
+  if (availability !== 'active') return { availability, share };
+  incrementShareDownload.run(share.id);
+  incrementDownloadCount.run(share.fileId);
+  share.downloadCount += 1;
+  return { availability: 'active', share };
+});
+const releaseShareDownload = db.transaction((share) => {
+  decrementShareDownload.run(share.id);
+  decrementDownloadCount.run(share.fileId);
+});
 
 function publicFile(file) {
   return {
@@ -173,6 +285,107 @@ function publicFile(file) {
     downloadUrl: `/api/files/${file.id}/download`,
     previewUrl: `/api/files/${file.id}/preview`
   };
+}
+
+function publicBaseUrl(req) {
+  if (PUBLIC_BASE_URL) {
+    try {
+      const configured = new URL(PUBLIC_BASE_URL);
+      if (configured.protocol === 'http:' || configured.protocol === 'https:') {
+        return configured.href.replace(/\/$/, '');
+      }
+    } catch {
+      // Fall back to the current request origin when configuration is invalid.
+    }
+  }
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function publicShare(share, req) {
+  const url = `/s/${share.token}`;
+  const now = Date.now();
+  return {
+    id: share.id,
+    fileId: share.fileId,
+    url,
+    fullUrl: `${publicBaseUrl(req)}${url}`,
+    createdAt: share.createdAt,
+    expiresAt: share.expiresAt,
+    maxDownloads: share.maxDownloads,
+    downloadCount: share.downloadCount || 0,
+    revokedAt: share.revokedAt || null,
+    isExpired: Boolean(share.expiresAt && Date.parse(share.expiresAt) <= now),
+    isLimitReached: share.maxDownloads !== null
+      && share.downloadCount >= share.maxDownloads
+  };
+}
+
+function shareAvailability(share) {
+  if (!share || share.fileDeletedAt) return 'missing';
+  if (share.revokedAt) return 'revoked';
+  if (share.expiresAt && Date.parse(share.expiresAt) <= Date.now()) return 'expired';
+  if (share.maxDownloads !== null && share.downloadCount >= share.maxDownloads) return 'limited';
+  return 'active';
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / (1024 ** unit);
+  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(2)} ${units[unit]}`;
+}
+
+function sendSharePage(res, { statusCode, title, message, share = null }) {
+  const active = share && statusCode === 200;
+  const remaining = active && share.maxDownloads !== null
+    ? Math.max(share.maxDownloads - share.downloadCount, 0)
+    : null;
+  const details = active
+    ? `<dl class="share-details">
+        <div><dt>文件大小</dt><dd>${escapeHtml(formatFileSize(share.size))}</dd></div>
+        <div><dt>文件类型</dt><dd>${escapeHtml(share.mimeType)}</dd></div>
+        <div><dt>过期时间</dt><dd>${escapeHtml(share.expiresAt || '不限')}</dd></div>
+        <div><dt>剩余下载</dt><dd>${remaining === null ? '不限次数' : `${remaining} 次`}</dd></div>
+      </dl>`
+    : '';
+  const action = active
+    ? `<a class="share-download" href="/s/${encodeURIComponent(share.token)}/download">下载文件</a>`
+    : '<a class="share-secondary" href="/">返回 ClawDrop</a>';
+  res.status(statusCode).type('html').send(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f3f6fb">
+  <title>${escapeHtml(title)} · ClawDrop</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/share.css">
+</head>
+<body>
+  <main class="share-shell">
+    <section class="share-card">
+      <div class="share-brand"><span class="share-mark" aria-hidden="true">◆</span>ClawDrop</div>
+      <p class="share-label">临时文件分享</p>
+      <h1>${escapeHtml(title)}</h1>
+      <p class="share-message">${escapeHtml(message)}</p>
+      ${details}
+      <div class="share-actions">${action}</div>
+      <p class="share-footnote">此页面只提供当前文件，不包含文件列表或管理权限。</p>
+    </section>
+  </main>
+</body>
+</html>`);
 }
 
 async function sha256File(filePath) {
@@ -191,6 +404,38 @@ async function fileExists(filePath) {
   }
 }
 
+async function runCleanup({ olderThanDays, dryRun }) {
+  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
+  const files = listFilesOlderThan.all(cutoff);
+  const result = {
+    ok: true,
+    dryRun,
+    matched: files.length,
+    deleted: 0,
+    failed: 0
+  };
+  if (!dryRun) {
+    for (const file of files) {
+      const filePath = safeStoredPath(file.storedName);
+      if (!filePath) {
+        result.failed += 1;
+        continue;
+      }
+      try {
+        await fsp.unlink(filePath).catch((error) => {
+          if (error.code !== 'ENOENT') throw error;
+        });
+        softDeleteFileAndShares(new Date().toISOString(), file.id);
+        result.deleted += 1;
+      } catch {
+        result.failed += 1;
+      }
+    }
+  }
+  console.log(`[cleanup] dryRun=${dryRun} matched=${result.matched} deleted=${result.deleted} failed=${result.failed}`);
+  return result;
+}
+
 const app = express();
 app.disable('x-powered-by');
 app.use((_req, res, next) => {
@@ -202,6 +447,7 @@ app.use((_req, res, next) => {
   });
   next();
 });
+app.use(express.json({ limit: '16kb' }));
 
 app.get('/api/health', async (_req, res) => {
   const storageReady = await fileExists(STORAGE_DIR);
@@ -262,6 +508,20 @@ app.post('/api/upload', requireUploadToken, (req, res, next) => {
   });
 });
 
+app.post('/api/admin/cleanup', requireAdminToken, async (req, res) => {
+  const olderThanDays = req.body?.olderThanDays === undefined
+    ? AUTO_CLEANUP_DAYS
+    : req.body.olderThanDays;
+  const dryRun = req.body?.dryRun === undefined ? true : req.body.dryRun;
+  if (!Number.isFinite(olderThanDays) || olderThanDays < 1 || olderThanDays > 3650) {
+    return res.status(400).json({ ok: false, error: 'olderThanDays must be a number from 1 to 3650' });
+  }
+  if (typeof dryRun !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'dryRun must be a boolean' });
+  }
+  return res.json(await runCleanup({ olderThanDays, dryRun }));
+});
+
 app.get('/api/files', requireAdminToken, (_req, res) => {
   res.json({ ok: true, files: listActiveFiles.all().map(publicFile) });
 });
@@ -270,6 +530,135 @@ app.get('/api/files/:id', requireAdminToken, (req, res) => {
   const file = getActiveFile.get(req.params.id);
   if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
   return res.json({ ok: true, file: publicFile(file) });
+});
+
+app.post('/api/files/:id/share', requireAdminToken, (req, res) => {
+  const file = getActiveFile.get(req.params.id);
+  if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
+
+  const expiresInHours = req.body?.expiresInHours === undefined
+    ? 24
+    : req.body.expiresInHours;
+  const maxDownloads = req.body?.maxDownloads === undefined
+    ? null
+    : req.body.maxDownloads;
+  if (!Number.isInteger(expiresInHours) || expiresInHours < 1 || expiresInHours > 168) {
+    return res.status(400).json({ ok: false, error: 'expiresInHours must be an integer from 1 to 168' });
+  }
+  if (maxDownloads !== null
+      && (!Number.isInteger(maxDownloads) || maxDownloads < 1 || maxDownloads > 100)) {
+    return res.status(400).json({ ok: false, error: 'maxDownloads must be null or an integer from 1 to 100' });
+  }
+
+  const createdAt = new Date();
+  const share = {
+    id: crypto.randomUUID(),
+    fileId: file.id,
+    token: crypto.randomBytes(32).toString('base64url'),
+    createdAt: createdAt.toISOString(),
+    expiresAt: new Date(createdAt.getTime() + expiresInHours * 60 * 60 * 1000).toISOString(),
+    maxDownloads,
+    downloadCount: 0,
+    revokedAt: null
+  };
+  insertShare.run(share);
+  return res.status(201).json({ ok: true, share: publicShare(share, req) });
+});
+
+app.get('/api/files/:id/shares', requireAdminToken, (req, res) => {
+  const file = getActiveFile.get(req.params.id);
+  if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
+  const shares = listActiveSharesByFile.all(file.id).map((share) => publicShare(share, req));
+  return res.json({ ok: true, shares });
+});
+
+app.delete('/api/shares/:id', requireAdminToken, (req, res) => {
+  const result = revokeShare.run(new Date().toISOString(), req.params.id);
+  if (result.changes === 0) {
+    return res.status(404).json({ ok: false, error: 'Share not found' });
+  }
+  return res.json({ ok: true });
+});
+
+app.get('/s/:token', async (req, res) => {
+  const share = /^[A-Za-z0-9_-]{43,}$/.test(req.params.token)
+    ? getShareByToken.get(req.params.token)
+    : null;
+  const availability = shareAvailability(share);
+  if (availability === 'missing') {
+    return sendSharePage(res, {
+      statusCode: 404,
+      title: '分享链接不存在',
+      message: '这个分享链接无效，或对应文件已不可用。'
+    });
+  }
+  if (availability === 'revoked') {
+    return sendSharePage(res, { statusCode: 410, title: '链接已失效', message: '分享者已撤销这个链接。' });
+  }
+  if (availability === 'expired') {
+    return sendSharePage(res, { statusCode: 410, title: '链接已过期', message: '这个临时分享已超过有效期。' });
+  }
+  if (availability === 'limited') {
+    return sendSharePage(res, { statusCode: 410, title: '下载次数已用完', message: '这个分享链接已达到下载次数上限。' });
+  }
+  const filePath = safeStoredPath(share.storedName);
+  if (!filePath || !(await fileExists(filePath))) {
+    return sendSharePage(res, {
+      statusCode: 404,
+      title: '分享文件不可用',
+      message: '文件已被删除或暂时无法访问。'
+    });
+  }
+  return sendSharePage(res, {
+    statusCode: 200,
+    title: share.originalName,
+    message: '此文件由 ClawDrop 临时分享。',
+    share
+  });
+});
+
+app.get('/s/:token/download', async (req, res, next) => {
+  const token = /^[A-Za-z0-9_-]{43,}$/.test(req.params.token)
+    ? req.params.token
+    : null;
+  const initialShare = token ? getShareByToken.get(token) : null;
+  const initialAvailability = shareAvailability(initialShare);
+  if (initialAvailability === 'missing') {
+    return sendSharePage(res, { statusCode: 404, title: '分享链接不存在', message: '这个分享链接无效，或对应文件已不可用。' });
+  }
+  if (initialAvailability === 'revoked') {
+    return sendSharePage(res, { statusCode: 410, title: '链接已失效', message: '分享者已撤销这个链接。' });
+  }
+  if (initialAvailability === 'expired') {
+    return sendSharePage(res, { statusCode: 410, title: '链接已过期', message: '这个临时分享已超过有效期。' });
+  }
+  if (initialAvailability === 'limited') {
+    return sendSharePage(res, { statusCode: 410, title: '下载次数已用完', message: '这个分享链接已达到下载次数上限。' });
+  }
+
+  const filePath = safeStoredPath(initialShare.storedName);
+  if (!filePath || !(await fileExists(filePath))) {
+    return sendSharePage(res, { statusCode: 404, title: '分享文件不可用', message: '文件已被删除或暂时无法访问。' });
+  }
+
+  const claimed = claimShareDownload(token);
+  if (claimed.availability !== 'active') {
+    const messages = {
+      missing: ['分享链接不存在', '这个分享链接无效，或对应文件已不可用。'],
+      revoked: ['链接已失效', '分享者已撤销这个链接。'],
+      expired: ['链接已过期', '这个临时分享已超过有效期。'],
+      limited: ['下载次数已用完', '这个分享链接已达到下载次数上限。']
+    };
+    const [title, message] = messages[claimed.availability];
+    return sendSharePage(res, { statusCode: claimed.availability === 'missing' ? 404 : 410, title, message });
+  }
+
+  return res.download(filePath, normalizeOriginalName(claimed.share.originalName), (error) => {
+    if (error) {
+      releaseShareDownload(claimed.share);
+      if (!res.headersSent) next(error);
+    }
+  });
 });
 
 app.get('/api/files/:id/download', requireAdminToken, async (req, res, next) => {
@@ -336,7 +725,7 @@ app.delete('/api/files/:id', requireAdminToken, async (req, res, next) => {
   }
   try {
     await fsp.unlink(filePath);
-    softDeleteFile.run(new Date().toISOString(), file.id);
+    softDeleteFileAndShares(new Date().toISOString(), file.id);
     return res.json({ ok: true });
   } catch (error) {
     if (error && error.code === 'ENOENT') {
@@ -369,7 +758,19 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`ClawDrop listening on http://${HOST}:${PORT}`);
 });
 
+let cleanupTimer = null;
+if (AUTO_CLEANUP_ENABLED) {
+  cleanupTimer = setInterval(() => {
+    runCleanup({ olderThanDays: AUTO_CLEANUP_DAYS, dryRun: false }).catch(() => {
+      console.error('[cleanup] scheduled cleanup failed');
+    });
+  }, AUTO_CLEANUP_INTERVAL_HOURS * 60 * 60 * 1000);
+  cleanupTimer.unref();
+  console.log(`[cleanup] enabled days=${AUTO_CLEANUP_DAYS} intervalHours=${AUTO_CLEANUP_INTERVAL_HOURS}`);
+}
+
 function shutdown() {
+  if (cleanupTimer) clearInterval(cleanupTimer);
   server.close(() => {
     db.close();
     process.exit(0);

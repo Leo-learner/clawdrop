@@ -1,6 +1,6 @@
 {
   "name": "clawdrop",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "A lightweight private file drop for OpenClaw.",
   "main": "server.js",

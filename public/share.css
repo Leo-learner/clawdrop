@@ -1,0 +1,58 @@
+:root {
+  color-scheme: light;
+  --bg: #f3f6fb;
+  --surface: #ffffff;
+  --text: #172033;
+  --muted: #667085;
+  --line: #dde3ed;
+  --blue: #1f64e9;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.share-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.share-card {
+  width: min(560px, 100%);
+  padding: 38px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 24px 70px rgba(31, 48, 78, 0.12);
+}
+
+.share-brand { display: flex; align-items: center; gap: 9px; margin-bottom: 48px; font-size: 19px; font-weight: 750; }
+.share-mark { color: var(--blue); font-size: 21px; }
+.share-label { margin: 0 0 8px; color: var(--blue); font-size: 12px; font-weight: 750; letter-spacing: 0.06em; }
+h1 { margin: 0; font-size: clamp(25px, 6vw, 34px); line-height: 1.15; overflow-wrap: anywhere; }
+.share-message { margin: 12px 0 26px; color: var(--muted); line-height: 1.6; }
+.share-details { margin: 0; border-top: 1px solid var(--line); }
+.share-details div { display: grid; grid-template-columns: 120px 1fr; gap: 18px; padding: 13px 0; border-bottom: 1px solid var(--line); }
+.share-details dt { color: var(--muted); }
+.share-details dd { margin: 0; font-weight: 620; overflow-wrap: anywhere; }
+.share-actions { margin-top: 28px; }
+.share-download,
+.share-secondary { display: block; min-height: 46px; padding: 12px 18px; border-radius: 7px; text-align: center; text-decoration: none; font-weight: 700; }
+.share-download { background: var(--blue); color: white; }
+.share-secondary { border: 1px solid var(--line); color: var(--text); }
+.share-footnote { margin: 18px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
+
+@media (max-width: 560px) {
+  .share-shell { padding: 16px; }
+  .share-card { padding: 28px 22px; }
+  .share-brand { margin-bottom: 38px; }
+  .share-details div { grid-template-columns: 1fr; gap: 3px; }
+}

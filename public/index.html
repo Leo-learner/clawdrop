@@ -53,6 +53,20 @@
           <h1 id="files-title">文件</h1>
           <p id="file-count" class="file-count"></p>
         </div>
+        <div class="file-tools">
+          <label class="search-field" for="file-search">
+            <span class="visually-hidden">搜索文件</span>
+            <input id="file-search" type="search" autocomplete="off" placeholder="搜索文件名或类型">
+          </label>
+          <div class="filter-group" role="group" aria-label="按文件类型筛选">
+            <button class="button filter-button active" type="button" data-filter="all" aria-pressed="true">全部</button>
+            <button class="button filter-button" type="button" data-filter="image" aria-pressed="false">图片</button>
+            <button class="button filter-button" type="button" data-filter="text" aria-pressed="false">文本</button>
+            <button class="button filter-button" type="button" data-filter="pdf" aria-pressed="false">PDF</button>
+            <button class="button filter-button" type="button" data-filter="archive" aria-pressed="false">压缩包</button>
+            <button class="button filter-button" type="button" data-filter="other" aria-pressed="false">其他</button>
+          </div>
+        </div>
         <div id="status-message" class="status-message" role="status" hidden></div>
         <div class="file-table" aria-live="polite">
           <div class="file-table-head" aria-hidden="true">
@@ -79,6 +93,44 @@
     <div id="preview-body" class="preview-body"></div>
     <div class="preview-footer">
       <button id="preview-download" class="button button-primary" type="button">下载文件</button>
+    </div>
+  </dialog>
+
+  <dialog id="share-dialog" class="share-dialog" aria-labelledby="share-title">
+    <div class="preview-header">
+      <div>
+        <h2 id="share-title">分享文件</h2>
+        <p id="share-meta" class="preview-meta"></p>
+      </div>
+      <button id="share-close" class="icon-button" type="button" aria-label="关闭分享管理">×</button>
+    </div>
+    <div class="share-body">
+      <form id="share-form" class="share-form">
+        <label class="share-field" for="share-expires-hours">
+          <span>有效期（小时）</span>
+          <input id="share-expires-hours" type="number" min="1" max="168" step="1" value="24" required>
+        </label>
+        <label class="share-field" for="share-max-downloads">
+          <span>最大下载次数</span>
+          <input id="share-max-downloads" type="number" min="1" max="100" step="1" placeholder="不限">
+        </label>
+        <button id="share-create" class="button button-primary" type="submit">创建分享链接</button>
+      </form>
+      <p id="share-error" class="form-error" role="alert" hidden></p>
+      <div id="share-result" class="share-result" hidden>
+        <span class="share-section-label">新分享链接</span>
+        <div class="share-copy-row">
+          <input id="share-result-url" type="text" readonly aria-label="新分享链接">
+          <button id="share-result-copy" class="button button-secondary" type="button">复制链接</button>
+        </div>
+      </div>
+      <section class="share-list-section" aria-labelledby="share-list-title">
+        <div class="share-list-heading">
+          <h3 id="share-list-title">已有分享</h3>
+          <button id="share-refresh" class="button button-quiet" type="button">刷新</button>
+        </div>
+        <div id="share-list" class="share-list" aria-live="polite"></div>
+      </section>
     </div>
   </dialog>
 
