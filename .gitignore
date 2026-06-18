@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/
+storage/
+*.log
+.DS_Store
+.cache/
+.playwright-cli/
+dist/
+build/
+coverage/
+.vscode/
+.idea/

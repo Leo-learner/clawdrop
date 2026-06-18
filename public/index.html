@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f3f6fb">
+  <title>ClawDrop</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section id="login-view" class="login-view" aria-labelledby="login-title">
+      <div class="login-card">
+        <div class="brand brand-login">
+          <span class="brand-mark" aria-hidden="true"><span></span></span>
+          <span>ClawDrop</span>
+        </div>
+        <h1 id="login-title">打开私有文件箱</h1>
+        <p class="login-copy">输入管理 token，查看、预览和管理 OpenClaw 投递的文件。</p>
+        <form id="login-form">
+          <input class="visually-hidden" type="text" name="username" value="admin" autocomplete="username" tabindex="-1" aria-hidden="true" hidden>
+          <label for="admin-token">ADMIN_TOKEN</label>
+          <div class="token-row">
+            <input id="admin-token" name="token" type="password" autocomplete="current-password" required placeholder="输入管理 token">
+            <button class="button button-primary" type="submit">进入文件箱</button>
+          </div>
+          <p class="privacy-note">Token 只保存在当前浏览器的 localStorage 中。</p>
+          <p id="login-error" class="form-error" role="alert" hidden></p>
+        </form>
+      </div>
+    </section>
+
+    <section id="app-view" class="app-view" hidden aria-labelledby="files-title">
+      <header class="app-header">
+        <div class="brand-group">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"><span></span></span>
+            <span>ClawDrop</span>
+          </div>
+          <span class="brand-divider" aria-hidden="true"></span>
+          <span class="subtitle">Private file inbox</span>
+        </div>
+        <div class="header-actions">
+          <button id="refresh-button" class="button button-quiet" type="button">↻ <span>刷新</span></button>
+          <button id="logout-button" class="button button-quiet" type="button">↪ <span>退出</span></button>
+        </div>
+      </header>
+
+      <section class="content">
+        <div class="content-heading">
+          <h1 id="files-title">文件</h1>
+          <p id="file-count" class="file-count"></p>
+        </div>
+        <div id="status-message" class="status-message" role="status" hidden></div>
+        <div class="file-table" aria-live="polite">
+          <div class="file-table-head" aria-hidden="true">
+            <span>文件名</span>
+            <span>大小</span>
+            <span>上传时间</span>
+            <span>类型 / 下载</span>
+            <span>操作</span>
+          </div>
+          <div id="file-list" class="file-list"></div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="preview-dialog" class="preview-dialog" aria-labelledby="preview-title">
+    <div class="preview-header">
+      <div>
+        <h2 id="preview-title"></h2>
+        <p id="preview-meta" class="preview-meta"></p>
+      </div>
+      <button id="preview-close" class="icon-button" type="button" aria-label="关闭预览">×</button>
+    </div>
+    <div id="preview-body" class="preview-body"></div>
+    <div class="preview-footer">
+      <button id="preview-download" class="button button-primary" type="button">下载文件</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

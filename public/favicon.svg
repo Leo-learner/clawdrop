@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ClawDrop">
+  <rect width="64" height="64" rx="13" fill="#1f64e9"/>
+  <path d="M32 11 53 32 32 53 11 32Z" fill="none" stroke="#fff" stroke-width="7"/>
+  <path d="M24 24h16v16H24z" fill="#fff"/>
+</svg>

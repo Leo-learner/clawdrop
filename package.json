@@ -1,0 +1,24 @@
+{
+  "name": "clawdrop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A lightweight private file drop for OpenClaw.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node --check server.js && node --check scripts/upload.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "mime-types": "^3.0.2",
+    "multer": "^2.0.2"
+  }
+}
