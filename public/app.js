@@ -11,6 +11,14 @@ const fileCount = document.querySelector('#file-count');
 const fileSearch = document.querySelector('#file-search');
 const filterButtons = [...document.querySelectorAll('.filter-button')];
 const statusMessage = document.querySelector('#status-message');
+const uploadForm = document.querySelector('#upload-form');
+const uploadInput = document.querySelector('#file-upload');
+const uploadButton = document.querySelector('#upload-button');
+const uploadProgressWrap = document.querySelector('#upload-progress-wrap');
+const uploadProgress = document.querySelector('#upload-progress');
+const uploadProgressText = document.querySelector('#upload-progress-text');
+const uploadStatus = document.querySelector('#upload-status');
+const rateLimitStatus = document.querySelector('#rate-limit-status');
 const previewDialog = document.querySelector('#preview-dialog');
 const previewTitle = document.querySelector('#preview-title');
 const previewMeta = document.querySelector('#preview-meta');
@@ -93,6 +101,12 @@ function formatBytes(bytes) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(2)} ${units[unit]}`;
 }
 
+function formatRateLimit(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return '100';
+  return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/\.?0+$/, '');
+}
+
 function formatDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '未知';
@@ -173,11 +187,11 @@ function renderFiles() {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
     const title = document.createElement('strong');
-    title.textContent = currentFiles.length ? '没有匹配文件' : '文件箱还是空的';
+    title.textContent = currentFiles.length ? '没有匹配文件' : '暂无文件，上传一个文件开始使用';
     const detail = document.createElement('span');
     detail.textContent = currentFiles.length
       ? '换一个关键词或文件类型试试。'
-      : '使用上传脚本投递文件后，它们会出现在这里。';
+      : '可以从浏览器上传，也可以继续使用脚本投递文件。';
     empty.append(title, detail);
     fileList.append(empty);
     return;
@@ -234,6 +248,78 @@ async function loadFiles() {
       setStatus('无法读取文件列表，请稍后重试。', true);
     }
   }
+}
+
+async function loadConfig() {
+  try {
+    const response = await fetch('/api/config');
+    if (!response.ok) throw new Error('Config unavailable');
+    const config = await response.json();
+    rateLimitStatus.textContent = `当前下载限速：${formatRateLimit(config.downloadRateLimitKb)} KB/s`;
+  } catch {
+    rateLimitStatus.textContent = '当前下载限速：100 KB/s';
+  }
+}
+
+function setUploadStatus(message = '', isError = false) {
+  uploadStatus.textContent = message;
+  uploadStatus.classList.toggle('error', isError);
+  uploadStatus.hidden = !message;
+}
+
+function setUploadProgress(percent) {
+  uploadProgressWrap.hidden = false;
+  if (Number.isFinite(percent)) {
+    const bounded = Math.max(0, Math.min(100, Math.round(percent)));
+    uploadProgress.value = bounded;
+    uploadProgressText.textContent = `${bounded}%`;
+  } else {
+    uploadProgress.removeAttribute('value');
+    uploadProgressText.textContent = '上传中…';
+  }
+}
+
+function resetUploadProgress() {
+  uploadProgress.value = 0;
+  uploadProgress.setAttribute('value', '0');
+  uploadProgressText.textContent = '0%';
+  uploadProgressWrap.hidden = true;
+}
+
+function uploadSelectedFile(file) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('POST', '/api/files');
+    request.responseType = 'json';
+    request.setRequestHeader('Authorization', `Bearer ${getToken()}`);
+    request.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable) {
+        setUploadProgress((event.loaded / event.total) * 100);
+      } else {
+        setUploadProgress(null);
+      }
+    });
+    request.addEventListener('load', () => {
+      const body = request.response || {};
+      if (request.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        showLogin('管理 token 错误或已失效');
+        reject(new Error('Unauthorized'));
+        return;
+      }
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(body.error || '上传失败'));
+        return;
+      }
+      resolve(body.file);
+    });
+    request.addEventListener('error', () => reject(new Error('网络错误，上传失败')));
+    request.addEventListener('abort', () => reject(new Error('上传已取消')));
+
+    const form = new FormData();
+    form.append('file', file);
+    request.send(form);
+  });
 }
 
 function revokePreviewUrl() {
@@ -443,6 +529,38 @@ loginForm.addEventListener('submit', async (event) => {
   tokenInput.value = '';
 });
 
+uploadForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const file = uploadInput.files && uploadInput.files[0];
+  if (!file) {
+    setUploadStatus('请选择一个文件。', true);
+    return;
+  }
+  uploadButton.disabled = true;
+  setUploadStatus(`正在上传 ${file.name}…`);
+  setUploadProgress(0);
+  try {
+    await uploadSelectedFile(file);
+    setUploadProgress(100);
+    setUploadStatus('上传完成，文件列表已刷新。');
+    uploadInput.value = '';
+    await loadFiles();
+    showToast('文件已上传');
+    setTimeout(resetUploadProgress, 900);
+  } catch (error) {
+    if (error.message !== 'Unauthorized') {
+      setUploadStatus(error.message, true);
+    }
+  } finally {
+    uploadButton.disabled = false;
+  }
+});
+
+uploadInput.addEventListener('change', () => {
+  resetUploadProgress();
+  setUploadStatus();
+});
+
 fileSearch.addEventListener('input', () => {
   searchQuery = fileSearch.value.trim().toLowerCase();
   renderFiles();
@@ -534,6 +652,8 @@ shareDialog.addEventListener('close', () => {
 shareDialog.addEventListener('click', (event) => {
   if (event.target === shareDialog) shareDialog.close();
 });
+
+loadConfig();
 
 if (getToken()) {
   loadFiles();

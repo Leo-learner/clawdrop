@@ -4,6 +4,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const { Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const Database = require('better-sqlite3');
 const dotenv = require('dotenv');
 const express = require('express');
@@ -35,6 +37,12 @@ const parsedCleanupInterval = Number.parseFloat(process.env.AUTO_CLEANUP_INTERVA
 const AUTO_CLEANUP_INTERVAL_HOURS = Number.isFinite(parsedCleanupInterval) && parsedCleanupInterval > 0
   ? parsedCleanupInterval
   : 12;
+const parsedRateLimit = Number.parseFloat(process.env.CLAWDROP_RATE_LIMIT_KB || '100');
+const DOWNLOAD_RATE_LIMIT_KB = Number.isFinite(parsedRateLimit) && parsedRateLimit > 0
+  ? parsedRateLimit
+  : 100;
+const DOWNLOAD_RATE_LIMIT_BYTES_PER_SECOND = Math.max(1, Math.floor(DOWNLOAD_RATE_LIMIT_KB * 1024));
+const DOWNLOAD_STREAM_CHUNK_BYTES = 16 * 1024;
 
 function resolveProjectPath(configuredPath, fallback) {
   const value = configuredPath || fallback;
@@ -345,6 +353,59 @@ function formatFileSize(bytes) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(2)} ${units[unit]}`;
 }
 
+function formatRateLimitKb(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.?0+$/, '');
+}
+
+function createDownloadThrottle(bytesPerSecond) {
+  let scheduledAt = Date.now();
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      const now = Date.now();
+      const delayMs = Math.max(0, scheduledAt - now);
+      scheduledAt = Math.max(now, scheduledAt) + (chunk.length / bytesPerSecond) * 1000;
+      setTimeout(() => callback(null, chunk), delayMs);
+    }
+  });
+}
+
+async function sendRateLimitedDownload(req, res, next, {
+  filePath,
+  originalName,
+  onComplete,
+  onFailure
+}) {
+  try {
+    const stats = await fsp.stat(filePath);
+    if (!stats.isFile()) {
+      if (!res.headersSent) res.status(404).json({ ok: false, error: 'File not found' });
+      return;
+    }
+
+    res.attachment(normalizeOriginalName(originalName));
+    res.set({
+      'Accept-Ranges': 'none',
+      'Content-Length': String(stats.size),
+      'X-ClawDrop-Rate-Limit-KB': formatRateLimitKb(DOWNLOAD_RATE_LIMIT_KB)
+    });
+
+    await pipeline(
+      fs.createReadStream(filePath, { highWaterMark: DOWNLOAD_STREAM_CHUNK_BYTES }),
+      createDownloadThrottle(DOWNLOAD_RATE_LIMIT_BYTES_PER_SECOND),
+      res
+    );
+    if (onComplete) onComplete();
+  } catch (error) {
+    if (onFailure) onFailure(error);
+    if (error && (error.code === 'ERR_STREAM_PREMATURE_CLOSE' || req.destroyed || res.destroyed)) {
+      return;
+    }
+    if (!res.headersSent) {
+      next(error);
+    }
+  }
+}
+
 function sendSharePage(res, { statusCode, title, message, share = null }) {
   const active = share && statusCode === 200;
   const remaining = active && share.maxDownloads !== null
@@ -436,37 +497,7 @@ async function runCleanup({ olderThanDays, dryRun }) {
   return result;
 }
 
-const app = express();
-app.disable('x-powered-by');
-app.use((_req, res, next) => {
-  res.set({
-    'Content-Security-Policy': "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' blob: data:; frame-src blob:; script-src 'self'; style-src 'self'; connect-src 'self'",
-    'Referrer-Policy': 'no-referrer',
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY'
-  });
-  next();
-});
-app.use(express.json({ limit: '16kb' }));
-
-app.get('/api/health', async (_req, res) => {
-  const storageReady = await fileExists(STORAGE_DIR);
-  let databaseReady = false;
-  try {
-    databaseReady = db.prepare('SELECT 1 AS ready').get().ready === 1;
-  } catch {
-    databaseReady = false;
-  }
-  res.json({
-    ok: storageReady && databaseReady,
-    name: 'clawdrop',
-    time: new Date().toISOString(),
-    storageReady,
-    databaseReady
-  });
-});
-
-app.post('/api/upload', requireUploadToken, (req, res, next) => {
+function handleUpload(req, res, next) {
   upload.single('file')(req, res, async (uploadError) => {
     if (uploadError) {
       if (uploadError instanceof multer.MulterError && uploadError.code === 'LIMIT_FILE_SIZE') {
@@ -506,7 +537,48 @@ app.post('/api/upload', requireUploadToken, (req, res, next) => {
       return next(error);
     }
   });
+}
+
+const app = express();
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.set({
+    'Content-Security-Policy': "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' blob: data:; frame-src blob:; script-src 'self'; style-src 'self'; connect-src 'self'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY'
+  });
+  next();
 });
+app.use(express.json({ limit: '16kb' }));
+
+app.get('/api/health', async (_req, res) => {
+  const storageReady = await fileExists(STORAGE_DIR);
+  let databaseReady = false;
+  try {
+    databaseReady = db.prepare('SELECT 1 AS ready').get().ready === 1;
+  } catch {
+    databaseReady = false;
+  }
+  res.json({
+    ok: storageReady && databaseReady,
+    name: 'clawdrop',
+    time: new Date().toISOString(),
+    storageReady,
+    databaseReady
+  });
+});
+
+app.get('/api/config', (_req, res) => {
+  res.json({
+    ok: true,
+    maxFileSizeMb: MAX_FILE_SIZE_MB,
+    downloadRateLimitKb: DOWNLOAD_RATE_LIMIT_KB
+  });
+});
+
+app.post('/api/upload', requireUploadToken, handleUpload);
+app.post('/api/files', requireAdminToken, handleUpload);
 
 app.post('/api/admin/cleanup', requireAdminToken, async (req, res) => {
   const olderThanDays = req.body?.olderThanDays === undefined
@@ -653,10 +725,11 @@ app.get('/s/:token/download', async (req, res, next) => {
     return sendSharePage(res, { statusCode: claimed.availability === 'missing' ? 404 : 410, title, message });
   }
 
-  return res.download(filePath, normalizeOriginalName(claimed.share.originalName), (error) => {
-    if (error) {
+  return sendRateLimitedDownload(req, res, next, {
+    filePath,
+    originalName: claimed.share.originalName,
+    onFailure: () => {
       releaseShareDownload(claimed.share);
-      if (!res.headersSent) next(error);
     }
   });
 });
@@ -668,11 +741,11 @@ app.get('/api/files/:id/download', requireAdminToken, async (req, res, next) => 
     return res.status(404).json({ ok: false, error: 'File not found' });
   }
 
-  return res.download(filePath, normalizeOriginalName(file.originalName), (error) => {
-    if (!error) {
+  return sendRateLimitedDownload(req, res, next, {
+    filePath,
+    originalName: file.originalName,
+    onComplete: () => {
       incrementDownloadCount.run(file.id);
-    } else if (!res.headersSent) {
-      next(error);
     }
   });
 });

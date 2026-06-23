@@ -1,6 +1,6 @@
 # ClawDrop
 
-ClawDrop 是一个部署在云电脑本机的轻量私有文件投递箱。OpenClaw 使用上传专用 token 提交文件；管理员在 Mac、iPhone、iPad 等设备的浏览器中搜索、预览、下载、删除文件，并可按需创建有时效、可限次、可撤销的临时分享链接。
+ClawDrop 是一个可部署到云服务器上的轻量私人云文件传输 / 网盘项目。OpenClaw 或脚本可以使用上传专用 token 提交文件；管理员也可以直接在 Mac、iPhone、iPad 等设备的浏览器中上传、搜索、预览、下载、删除文件，并可按需创建有时效、可限次、可撤销的临时分享链接。
 
 项目保持单实例、单管理员：原生 HTML/CSS/JavaScript 前端，Node.js + Express 后端，SQLite 元数据和本地 `storage/` 文件存储。它不是复杂网盘，也不提供多用户或目录同步。
 
@@ -8,6 +8,8 @@ ClawDrop 是一个部署在云电脑本机的轻量私有文件投递箱。OpenC
 
 - 保留 v1 文件上传、列表、详情、安全预览、下载和软删除 API
 - `UPLOAD_TOKEN` 与 `ADMIN_TOKEN` 严格分权
+- 浏览器管理页支持选择文件上传、上传进度、完成后自动刷新文件列表
+- 管理员下载和公开分享下载默认限速 `100 KB/s`，可通过 `CLAWDROP_RATE_LIMIT_KB` 调整
 - 临时分享链接：有效期 1–168 小时、可限制 1–100 次下载、可随时撤销
 - 分享页面无需管理 token，只展示并下载一个指定文件
 - 管理页按文件名/MIME 搜索，并按图片、文本、PDF、压缩包、其他筛选
@@ -49,6 +51,12 @@ npm start
 
 没有 `.env` 时服务仍可启动，但受保护接口会拒绝请求。示例 token、短 token 或两个 token 相同时，启动日志会显示安全警告，但不会打印 token 内容。
 
+临时覆盖下载限速可直接在启动命令前设置环境变量：
+
+```bash
+CLAWDROP_RATE_LIMIT_KB=500 npm start
+```
+
 ## 环境变量
 
 | 变量 | 默认值/示例 | 说明 |
@@ -58,6 +66,7 @@ npm start
 | `UPLOAD_TOKEN` | 无 | 只允许上传文件 |
 | `ADMIN_TOKEN` | 无 | 允许文件和分享链接管理 |
 | `MAX_FILE_SIZE_MB` | `200` | 单文件上限（MB） |
+| `CLAWDROP_RATE_LIMIT_KB` | `100` | 下载限速，单位 KB/s；只影响文件下载，不影响页面和 API 列表 |
 | `STORAGE_DIR` | `storage` | 文件目录；相对路径以项目目录为基准 |
 | `DATABASE_PATH` | `data/clawdrop.sqlite` | SQLite 路径 |
 | `PUBLIC_BASE_URL` | `http://localhost:3010` | 分享链接的外部基础地址；留空时使用当前请求的 host |
@@ -65,7 +74,16 @@ npm start
 | `AUTO_CLEANUP_DAYS` | `30` | 清理早于多少天的文件 |
 | `AUTO_CLEANUP_INTERVAL_HOURS` | `12` | 定时扫描间隔（小时） |
 
-`.env`、`data/`、`storage/` 均被 Git 忽略，不会上传到 GitHub。
+`.env`、`data/`、`storage/` 均被 Git 忽略，不会上传到 GitHub。真实上传文件默认保存在 `storage/`；首次启动会自动创建目录，不需要把上传内容提交进 Git。
+
+## 上传目录与限速
+
+- 默认上传目录是 `storage/`，可用 `STORAGE_DIR=/path/to/uploads` 改到代码目录之外。
+- 上传文件使用随机 UUID 作为磁盘文件名，原始文件名只保存在 SQLite 元数据里。
+- `.gitignore` 已忽略 `storage/`，避免真实上传文件进入仓库。
+- 下载限速默认 `100 KB/s`，可设置 `CLAWDROP_RATE_LIMIT_KB=500 npm start` 改为 `500 KB/s`。
+- 限速使用 Node.js 流式下载和 Transform 节流实现，不会一次性把大文件读入内存，也不会阻塞普通页面访问。
+- 本阶段只实现下载限速；上传限速后续可继续加入，目前上传仍受 `MAX_FILE_SIZE_MB` 约束。
 
 ## Mac 本地测试
 
@@ -89,7 +107,7 @@ curl http://127.0.0.1:3010/api/health
 curl -i http://127.0.0.1:3010/api/files  # 应返回 401
 ```
 
-`npm test` 使用 Node 内置 test runner，覆盖双 token 隔离、分享链接正常/过期/限次/撤销、HTML 纯文本预览、删除联动失效和自动清理。
+`npm test` 使用 Node 内置 test runner，覆盖双 token 隔离、浏览器管理上传、下载限速配置、分享链接正常/过期/限次/撤销、HTML 纯文本预览、删除联动失效和自动清理。
 
 ## 临时分享链接
 
@@ -183,7 +201,9 @@ v1 上传脚本返回的是受 `ADMIN_TOKEN` 保护的下载/预览地址，不�
 | 方法 | 路径 | 鉴权 | 用途 |
 | --- | --- | --- | --- |
 | `GET` | `/api/health` | 无 | 健康检查 |
+| `GET` | `/api/config` | 无 | 前端读取最大文件大小和当前下载限速 |
 | `POST` | `/api/upload` | `UPLOAD_TOKEN` | multipart 单文件上传，字段名 `file` |
+| `POST` | `/api/files` | `ADMIN_TOKEN` | 浏览器管理页 multipart 单文件上传，字段名 `file` |
 | `GET` | `/api/files` | `ADMIN_TOKEN` | 文件列表 |
 | `GET` | `/api/files/:id` | `ADMIN_TOKEN` | 文件详情 |
 | `GET` | `/api/files/:id/download` | `ADMIN_TOKEN` | 管理员附件下载 |
@@ -204,6 +224,7 @@ Authorization: Bearer <TOKEN>
 
 ## 安全注意事项
 
+- 当前版本适合私人网络、VPN、内网或已有反向代理保护的环境使用；公网直接暴露前建议再增加登录认证、HTTPS 和网络层访问控制。
 - `UPLOAD_TOKEN` 与 `ADMIN_TOKEN` 应使用不同的至少 32 字符随机值；不要把 `ADMIN_TOKEN` 给 OpenClaw，也不要公开 `UPLOAD_TOKEN`。
 - Token 不写入源码、URL 或日志。管理 token 仅存于浏览器 localStorage；分享 token 只存在于分享 URL，不存入 localStorage。
 - 分享 token 使用至少 32 字节密码学随机数，不能由文件 ID 推导，适合短期交付，不应代替长期访问控制。
@@ -212,6 +233,10 @@ Authorization: Bearer <TOKEN>
 - HTML、JavaScript、CSS 按 `text/plain` 预览，并保留 CSP、Referrer-Policy、nosniff 和 X-Frame-Options。
 - 文本预览最多 2 MB，单文件上传默认最多 200 MB。
 - 如果暴露公网，务必使用强 token、HTTPS、严格防火墙规则，并建议使用 Caddy/Nginx 反向代理鉴权或网络层访问控制。
+
+## 后续服务器部署提示
+
+本仓库代码可后续拉取到 Azure Ubuntu 等云服务器运行。正式部署前建议准备强随机 `.env`、独立 `STORAGE_DIR`、进程守护、HTTPS 反向代理、访问日志轮转和备份策略。本阶段不包含服务器连接、Nginx 修改、HTTPS 申请或部署操作。
 
 ## 后续可选优化
 

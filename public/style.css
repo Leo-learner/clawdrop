@@ -76,7 +76,7 @@ button { cursor: pointer; }
   gap: 13px;
   font-size: 22px;
   font-weight: 720;
-  letter-spacing: -0.025em;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 
@@ -104,9 +104,9 @@ button { cursor: pointer; }
 .brand-mark span { width: 12px; height: 12px; background: var(--blue); z-index: 1; }
 
 h1, h2, p { margin-top: 0; }
-.login-card h1 { margin-bottom: 10px; font-size: 30px; line-height: 1.2; letter-spacing: -0.03em; }
+.login-card h1 { margin-bottom: 10px; font-size: 30px; line-height: 1.2; letter-spacing: 0; }
 .login-copy { color: var(--muted); margin-bottom: 32px; }
-label { display: block; margin-bottom: 8px; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; color: #475467; }
+label { display: block; margin-bottom: 8px; font-size: 12px; font-weight: 700; letter-spacing: 0; color: #475467; }
 
 .token-row { display: flex; gap: 10px; }
 input {
@@ -164,8 +164,94 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(31, 100, 233
 
 .content { padding: 34px 22px 44px; }
 .content-heading { display: flex; align-items: baseline; gap: 12px; padding: 0 8px; }
-.content h1 { margin-bottom: 24px; font-size: 30px; line-height: 1.2; letter-spacing: -0.035em; }
+.content h1 { margin-bottom: 24px; font-size: 30px; line-height: 1.2; letter-spacing: 0; }
 .file-count { color: var(--muted); font-size: 13px; }
+
+.upload-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(320px, 1.4fr);
+  gap: 18px;
+  align-items: center;
+  margin: 0 8px 24px;
+  padding: 18px;
+  border: 1px solid #cfdced;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #ffffff 0%, #f6fbff 100%);
+}
+
+.upload-panel h2 {
+  margin-bottom: 5px;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.rate-limit-status {
+  margin: 0;
+  color: #237a4b;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.upload-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.file-picker { margin: 0; }
+.file-picker span { display: block; margin-bottom: 7px; }
+.file-picker input {
+  width: 100%;
+  height: auto;
+  min-height: 46px;
+  padding: 10px 12px;
+}
+
+.upload-progress-wrap {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px;
+  gap: 10px;
+  align-items: center;
+}
+
+.upload-progress-wrap progress {
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: #dbe5f2;
+}
+
+.upload-progress-wrap progress::-webkit-progress-bar {
+  background: #dbe5f2;
+}
+
+.upload-progress-wrap progress::-webkit-progress-value {
+  background: #1f64e9;
+}
+
+.upload-progress-wrap progress::-moz-progress-bar {
+  background: #1f64e9;
+}
+
+.upload-progress-wrap span {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.upload-status {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.upload-status.error { color: var(--danger); }
+.button:disabled { cursor: not-allowed; opacity: 0.62; }
 
 .file-tools {
   display: flex;
@@ -286,6 +372,8 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(31, 100, 233
   .app-header { padding: 14px 16px; }
   .brand-divider, .subtitle { display: none; }
   .content { padding: 28px 14px 32px; }
+  .upload-panel { grid-template-columns: 1fr; align-items: stretch; }
+  .upload-form { grid-template-columns: minmax(0, 1fr) auto; }
   .file-tools { align-items: stretch; flex-direction: column; }
   .search-field { width: 100%; }
   .filter-group { justify-content: flex-start; }
@@ -327,6 +415,10 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(31, 100, 233
   .header-actions .button span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   .content { padding: 24px 16px 32px; }
   .content h1 { font-size: 28px; margin-bottom: 18px; }
+  .upload-panel { margin: 0 0 22px; padding: 16px; }
+  .upload-form { grid-template-columns: 1fr; }
+  .upload-form .button-primary { min-height: 46px; }
+  .upload-progress-wrap { grid-template-columns: minmax(0, 1fr) 40px; }
   .login-view { min-height: 100vh; padding: 16px; }
   .login-card { padding: 30px 22px; }
   .brand-login { margin-bottom: 44px; }

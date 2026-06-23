@@ -135,7 +135,7 @@ describe('ClawDrop API', { concurrency: false }, () => {
     if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
   });
 
-  test('health endpoint is public and reports ready dependencies', async () => {
+  test('health and config endpoints are public and report ready dependencies', async () => {
     const response = await fetch(`${baseUrl}/api/health`);
     assert.equal(response.status, 200);
     const body = await response.json();
@@ -155,6 +155,14 @@ describe('ClawDrop API', { concurrency: false }, () => {
     migratedDatabase.close();
     assert.equal(shareTable.name, 'share_links');
     assert.equal(indexes.length, 3);
+
+    const config = await fetch(`${baseUrl}/api/config`);
+    assert.equal(config.status, 200);
+    assert.deepEqual(await config.json(), {
+      ok: true,
+      maxFileSizeMb: 1,
+      downloadRateLimitKb: 100
+    });
   });
 
   test('admin endpoints reject missing, wrong, and upload-only tokens', async () => {
@@ -197,6 +205,35 @@ describe('ClawDrop API', { concurrency: false }, () => {
     });
     assert.equal(detail.status, 200);
     assert.equal((await detail.json()).file.originalName, 'unsafe.html');
+  });
+
+  test('browser upload endpoint accepts only the admin token', async () => {
+    const deniedForm = new FormData();
+    deniedForm.append('file', new Blob(['denied']), 'browser-denied.txt');
+    const denied = await fetch(`${baseUrl}/api/files`, {
+      method: 'POST',
+      headers: bearer(UPLOAD_TOKEN),
+      body: deniedForm
+    });
+    assert.equal(denied.status, 401);
+
+    const acceptedForm = new FormData();
+    acceptedForm.append('file', new Blob(['browser upload']), '../browser-upload.txt');
+    const accepted = await fetch(`${baseUrl}/api/files`, {
+      method: 'POST',
+      headers: bearer(ADMIN_TOKEN),
+      body: acceptedForm
+    });
+    assert.equal(accepted.status, 201);
+    const body = await accepted.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.file.originalName, 'browser-upload.txt');
+
+    const deleted = await fetch(`${baseUrl}/api/files/${body.file.id}`, {
+      method: 'DELETE',
+      headers: bearer(ADMIN_TOKEN)
+    });
+    assert.equal(deleted.status, 200);
   });
 
   test('admin can create a high-entropy temporary share link', async () => {
@@ -253,6 +290,7 @@ describe('ClawDrop API', { concurrency: false }, () => {
     const response = await fetch(`${baseUrl}${activeShare.url}/download`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-disposition'), /^attachment;/);
+    assert.equal(response.headers.get('x-clawdrop-rate-limit-kb'), '100');
     assert.equal(await response.text(), '<script>alert(1)</script>\nhello');
 
     const sharesResponse = await fetch(`${baseUrl}/api/files/${uploadedId}/shares`, {
@@ -286,6 +324,8 @@ describe('ClawDrop API', { concurrency: false }, () => {
     });
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-disposition'), /^attachment;/);
+    assert.equal(response.headers.get('accept-ranges'), 'none');
+    assert.equal(response.headers.get('x-clawdrop-rate-limit-kb'), '100');
     assert.equal(await response.text(), '<script>alert(1)</script>\nhello');
 
     const detail = await fetch(`${baseUrl}/api/files/${uploadedId}`, {
@@ -509,6 +549,8 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.match(html, /ClawDrop/);
     assert.match(html, /autocomplete="username"/);
     assert.match(html, /id="file-search"/);
+    assert.match(html, /id="upload-form"/);
+    assert.match(html, /当前下载限速：100 KB\/s/);
     assert.match(html, /data-filter="image"/);
     assert.match(html, /data-filter="archive"/);
     assert.match(html, /id="share-dialog"/);

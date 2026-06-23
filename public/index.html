@@ -18,7 +18,7 @@
           <span>ClawDrop</span>
         </div>
         <h1 id="login-title">打开私有文件箱</h1>
-        <p class="login-copy">输入管理 token，查看、预览和管理 OpenClaw 投递的文件。</p>
+        <p class="login-copy">输入管理 token，查看、上传、预览和管理私人云文件。</p>
         <form id="login-form">
           <input class="visually-hidden" type="text" name="username" value="admin" autocomplete="username" tabindex="-1" aria-hidden="true" hidden>
           <label for="admin-token">ADMIN_TOKEN</label>
@@ -40,7 +40,7 @@
             <span>ClawDrop</span>
           </div>
           <span class="brand-divider" aria-hidden="true"></span>
-          <span class="subtitle">Private file inbox</span>
+          <span class="subtitle">轻量私人云文件传输</span>
         </div>
         <div class="header-actions">
           <button id="refresh-button" class="button button-quiet" type="button">↻ <span>刷新</span></button>
@@ -53,6 +53,24 @@
           <h1 id="files-title">文件</h1>
           <p id="file-count" class="file-count"></p>
         </div>
+        <section class="upload-panel" aria-labelledby="upload-title">
+          <div>
+            <h2 id="upload-title">上传文件</h2>
+            <p id="rate-limit-status" class="rate-limit-status">当前下载限速：100 KB/s</p>
+          </div>
+          <form id="upload-form" class="upload-form">
+            <label class="file-picker" for="file-upload">
+              <span>选择文件</span>
+              <input id="file-upload" name="file" type="file" required>
+            </label>
+            <button id="upload-button" class="button button-primary" type="submit">上传</button>
+            <div id="upload-progress-wrap" class="upload-progress-wrap" hidden>
+              <progress id="upload-progress" value="0" max="100"></progress>
+              <span id="upload-progress-text">0%</span>
+            </div>
+            <p id="upload-status" class="upload-status" role="status" hidden></p>
+          </form>
+        </section>
         <div class="file-tools">
           <label class="search-field" for="file-search">
             <span class="visually-hidden">搜索文件</span>
