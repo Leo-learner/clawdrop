@@ -290,6 +290,8 @@ describe('ClawDrop API', { concurrency: false }, () => {
     const response = await fetch(`${baseUrl}${activeShare.url}/download`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-disposition'), /^attachment;/);
+    assert.match(response.headers.get('content-type'), /^text\/html/);
+    assert.equal(Number(response.headers.get('content-length')) > 0, true);
     assert.equal(response.headers.get('x-clawdrop-rate-limit-kb'), '100');
     assert.equal(await response.text(), '<script>alert(1)</script>\nhello');
 
@@ -324,6 +326,8 @@ describe('ClawDrop API', { concurrency: false }, () => {
     });
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-disposition'), /^attachment;/);
+    assert.match(response.headers.get('content-type'), /^text\/html/);
+    assert.equal(Number(response.headers.get('content-length')) > 0, true);
     assert.equal(response.headers.get('accept-ranges'), 'none');
     assert.equal(response.headers.get('x-clawdrop-rate-limit-kb'), '100');
     assert.equal(await response.text(), '<script>alert(1)</script>\nhello');
@@ -550,6 +554,9 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.match(html, /autocomplete="username"/);
     assert.match(html, /id="file-search"/);
     assert.match(html, /id="upload-form"/);
+    assert.match(html, /id="download-progress-wrap"/);
+    assert.match(html, /id="download-progress"/);
+    assert.match(html, /id="download-progress-status"/);
     assert.match(html, /当前下载限速：100 KB\/s/);
     assert.match(html, /data-filter="image"/);
     assert.match(html, /data-filter="archive"/);

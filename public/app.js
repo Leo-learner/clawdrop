@@ -19,6 +19,12 @@ const uploadProgress = document.querySelector('#upload-progress');
 const uploadProgressText = document.querySelector('#upload-progress-text');
 const uploadStatus = document.querySelector('#upload-status');
 const rateLimitStatus = document.querySelector('#rate-limit-status');
+const downloadProgressWrap = document.querySelector('#download-progress-wrap');
+const downloadProgressTitle = document.querySelector('#download-progress-title');
+const downloadProgressPercent = document.querySelector('#download-progress-percent');
+const downloadProgress = document.querySelector('#download-progress');
+const downloadProgressDetail = document.querySelector('#download-progress-detail');
+const downloadProgressStatus = document.querySelector('#download-progress-status');
 const previewDialog = document.querySelector('#preview-dialog');
 const previewTitle = document.querySelector('#preview-title');
 const previewMeta = document.querySelector('#preview-meta');
@@ -44,6 +50,11 @@ let currentShareFile = null;
 let activeFilter = 'all';
 let searchQuery = '';
 let toastTimer = null;
+let downloadHideTimer = null;
+let activeDownloadFileId = null;
+let activeDownloadController = null;
+let downloadRunId = 0;
+let currentDownloadRateLimit = '100';
 
 function getToken() {
   return localStorage.getItem(TOKEN_KEY) || '';
@@ -176,6 +187,10 @@ function makeAction(label, handler, isDanger = false) {
   return button;
 }
 
+function downloadMeta(file) {
+  return `${formatBytes(file.size)} · ${file.mimeType} · ${file.downloadCount} 次下载`;
+}
+
 function renderFiles() {
   const files = visibleFiles();
   fileList.replaceChildren();
@@ -212,11 +227,14 @@ function renderFiles() {
     downloads.textContent = `${file.downloadCount} 次下载`;
     type.append(downloads);
 
+    const downloadButton = makeAction('下载', () => downloadFile(file));
+    downloadButton.disabled = file.id === activeDownloadFileId;
+
     const actions = document.createElement('div');
     actions.className = 'file-actions';
     actions.append(
       makeAction('预览', () => previewFile(file)),
-      makeAction('下载', () => downloadFile(file)),
+      downloadButton,
       makeAction('创建分享', () => openShareDialog(file, true)),
       makeAction('管理分享', () => openShareDialog(file, false)),
       makeAction('删除', () => deleteFile(file), true)
@@ -255,8 +273,10 @@ async function loadConfig() {
     const response = await fetch('/api/config');
     if (!response.ok) throw new Error('Config unavailable');
     const config = await response.json();
-    rateLimitStatus.textContent = `当前下载限速：${formatRateLimit(config.downloadRateLimitKb)} KB/s`;
+    currentDownloadRateLimit = formatRateLimit(config.downloadRateLimitKb);
+    rateLimitStatus.textContent = `当前下载限速：${currentDownloadRateLimit} KB/s`;
   } catch {
+    currentDownloadRateLimit = '100';
     rateLimitStatus.textContent = '当前下载限速：100 KB/s';
   }
 }
@@ -284,6 +304,67 @@ function resetUploadProgress() {
   uploadProgress.setAttribute('value', '0');
   uploadProgressText.textContent = '0%';
   uploadProgressWrap.hidden = true;
+}
+
+function setDownloadStatus(message, isError = false) {
+  downloadProgressStatus.textContent = message;
+  downloadProgressStatus.classList.toggle('error', isError);
+}
+
+function setDownloadProgress({
+  fileName,
+  receivedBytes = 0,
+  totalBytes = 0,
+  status = '正在下载',
+  rateLimitKb = currentDownloadRateLimit,
+  isError = false
+}) {
+  clearTimeout(downloadHideTimer);
+  downloadProgressWrap.hidden = false;
+  const titlePrefix = status === '下载完成' || isError ? status : '正在下载';
+  downloadProgressTitle.textContent = fileName ? `${titlePrefix} ${fileName}` : `${titlePrefix}…`;
+
+  if (Number.isFinite(totalBytes) && totalBytes > 0) {
+    const percent = Math.max(0, Math.min(100, Math.round((receivedBytes / totalBytes) * 100)));
+    downloadProgress.value = percent;
+    downloadProgressPercent.textContent = `${percent}%`;
+    downloadProgressDetail.textContent = `${formatBytes(receivedBytes)} / ${formatBytes(totalBytes)} · 当前下载限速：${rateLimitKb} KB/s`;
+  } else {
+    downloadProgress.removeAttribute('value');
+    downloadProgressPercent.textContent = '进行中';
+    downloadProgressDetail.textContent = `已下载 ${formatBytes(receivedBytes)} · 当前下载限速：${rateLimitKb} KB/s`;
+  }
+
+  setDownloadStatus(status, isError);
+}
+
+function resetDownloadProgress(delayMs = 0) {
+  clearTimeout(downloadHideTimer);
+  const reset = () => {
+    downloadProgress.value = 0;
+    downloadProgress.setAttribute('value', '0');
+    downloadProgressPercent.textContent = '0%';
+    downloadProgressDetail.textContent = '0 B / 0 B';
+    downloadProgressTitle.textContent = '正在下载…';
+    setDownloadStatus('准备下载');
+    downloadProgressWrap.hidden = true;
+  };
+  if (delayMs > 0) {
+    downloadHideTimer = setTimeout(reset, delayMs);
+  } else {
+    reset();
+  }
+}
+
+function triggerBrowserDownload(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function uploadSelectedFile(file) {
@@ -330,7 +411,7 @@ function revokePreviewUrl() {
 async function previewFile(file) {
   currentPreviewFile = file;
   previewTitle.textContent = file.originalName;
-  previewMeta.textContent = `${formatBytes(file.size)} · ${file.mimeType} · ${file.downloadCount} 次下载`;
+  previewMeta.textContent = downloadMeta(file);
   previewBody.replaceChildren();
   previewBody.textContent = '正在载入预览…';
   previewDialog.showModal();
@@ -379,21 +460,100 @@ async function previewFile(file) {
 }
 
 async function downloadFile(file) {
+  if (activeDownloadController) {
+    activeDownloadController.abort();
+  }
+  const runId = downloadRunId + 1;
+  downloadRunId = runId;
+  const controller = new AbortController();
+  activeDownloadController = controller;
+  activeDownloadFileId = file.id;
+  renderFiles();
+  setDownloadProgress({
+    fileName: file.originalName,
+    receivedBytes: 0,
+    totalBytes: 0,
+    status: '正在连接…'
+  });
+
   try {
-    const response = await api(file.downloadUrl);
+    const response = await api(file.downloadUrl, { signal: controller.signal });
     if (!response.ok) throw new Error('下载失败');
-    const url = URL.createObjectURL(await response.blob());
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = file.originalName;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const headerLength = Number(response.headers.get('Content-Length'));
+    const hasKnownTotal = Number.isFinite(headerLength) && headerLength > 0;
+    const rateLimitKb = formatRateLimit(response.headers.get('X-ClawDrop-Rate-Limit-KB') || currentDownloadRateLimit);
+    const contentType = response.headers.get('Content-Type') || file.mimeType || 'application/octet-stream';
+    const chunks = [];
+    let receivedBytes = 0;
+
+    setDownloadProgress({
+      fileName: file.originalName,
+      receivedBytes,
+      totalBytes: hasKnownTotal ? headerLength : 0,
+      status: '正在下载',
+      rateLimitKb
+    });
+
+    if (response.body && typeof response.body.getReader === 'function') {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        receivedBytes += value.byteLength || value.length || 0;
+        if (runId === downloadRunId) {
+          setDownloadProgress({
+            fileName: file.originalName,
+            receivedBytes,
+            totalBytes: hasKnownTotal ? headerLength : 0,
+            status: '正在下载',
+            rateLimitKb
+          });
+        }
+      }
+    } else {
+      const blob = await response.blob();
+      chunks.push(blob);
+      receivedBytes = blob.size;
+    }
+
+    const blob = new Blob(chunks, { type: contentType });
+    if (runId !== downloadRunId) return;
+    const finalTotal = hasKnownTotal ? headerLength : receivedBytes;
+    setDownloadProgress({
+      fileName: file.originalName,
+      receivedBytes: finalTotal,
+      totalBytes: finalTotal,
+      status: '下载完成',
+      rateLimitKb
+    });
+    triggerBrowserDownload(blob, file.originalName);
     file.downloadCount += 1;
+    if (currentPreviewFile && currentPreviewFile.id === file.id) {
+      currentPreviewFile.downloadCount = file.downloadCount;
+      previewMeta.textContent = downloadMeta(currentPreviewFile);
+    }
     renderFiles();
+    showToast('下载完成');
+    resetDownloadProgress(1800);
   } catch (error) {
-    if (error.message !== 'Unauthorized') showToast('下载失败，请重试');
+    if (error.name === 'AbortError') return;
+    if (error.message !== 'Unauthorized') {
+      setDownloadProgress({
+        fileName: file.originalName,
+        receivedBytes: 0,
+        totalBytes: 0,
+        status: '下载失败，请重试',
+        isError: true
+      });
+      showToast('下载失败，请重试');
+    }
+  } finally {
+    if (runId === downloadRunId) {
+      activeDownloadController = null;
+      activeDownloadFileId = null;
+      renderFiles();
+    }
   }
 }
 

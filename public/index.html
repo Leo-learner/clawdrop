@@ -71,6 +71,15 @@
             <p id="upload-status" class="upload-status" role="status" hidden></p>
           </form>
         </section>
+        <div id="download-progress-wrap" class="download-progress-wrap" hidden>
+          <div class="download-progress-header">
+            <span id="download-progress-title">正在下载…</span>
+            <span id="download-progress-percent">0%</span>
+          </div>
+          <progress id="download-progress" value="0" max="100"></progress>
+          <p id="download-progress-detail">0 B / 0 B</p>
+          <p id="download-progress-status" class="download-progress-status" role="status">准备下载</p>
+        </div>
         <div class="file-tools">
           <label class="search-field" for="file-search">
             <span class="visually-hidden">搜索文件</span>

@@ -253,6 +253,70 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(31, 100, 233
 .upload-status.error { color: var(--danger); }
 .button:disabled { cursor: not-allowed; opacity: 0.62; }
 
+.download-progress-wrap {
+  margin: 0 8px 24px;
+  padding: 16px 18px;
+  border: 1px solid #cfdced;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.download-progress-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 10px;
+}
+
+.download-progress-header span:first-child {
+  min-width: 0;
+  color: var(--text);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.download-progress-header span:last-child {
+  flex: 0 0 auto;
+  color: var(--blue);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.download-progress-wrap progress {
+  display: block;
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: #dbe5f2;
+}
+
+.download-progress-wrap progress::-webkit-progress-bar {
+  background: #dbe5f2;
+}
+
+.download-progress-wrap progress::-webkit-progress-value {
+  background: #1f64e9;
+}
+
+.download-progress-wrap progress::-moz-progress-bar {
+  background: #1f64e9;
+}
+
+.download-progress-wrap progress:not([value]) {
+  background: linear-gradient(90deg, #dbe5f2 0%, #9fbcf6 50%, #dbe5f2 100%);
+}
+
+.download-progress-wrap p {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.download-progress-status.error { color: var(--danger); }
+
 .file-tools {
   display: flex;
   align-items: center;
@@ -419,6 +483,8 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(31, 100, 233
   .upload-form { grid-template-columns: 1fr; }
   .upload-form .button-primary { min-height: 46px; }
   .upload-progress-wrap { grid-template-columns: minmax(0, 1fr) 40px; }
+  .download-progress-wrap { margin: 0 0 22px; padding: 16px; }
+  .download-progress-header { align-items: flex-start; }
   .login-view { min-height: 100vh; padding: 16px; }
   .login-card { padding: 30px 22px; }
   .brand-login { margin-bottom: 44px; }

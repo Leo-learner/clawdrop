@@ -383,6 +383,7 @@ async function sendRateLimitedDownload(req, res, next, {
     }
 
     res.attachment(normalizeOriginalName(originalName));
+    res.type(mime.lookup(originalName) || 'application/octet-stream');
     res.set({
       'Accept-Ranges': 'none',
       'Content-Length': String(stats.size),
