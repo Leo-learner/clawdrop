@@ -429,7 +429,7 @@ function sendSharePage(res, { statusCode, title, message, share = null }) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#f3f6fb">
+  <meta name="theme-color" content="#f4f7f4">
   <title>${escapeHtml(title)} · ClawDrop</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/share.css">

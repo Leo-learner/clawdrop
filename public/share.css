@@ -1,11 +1,11 @@
 :root {
   color-scheme: light;
-  --bg: #f3f6fb;
-  --surface: #ffffff;
-  --text: #172033;
-  --muted: #667085;
-  --line: #dde3ed;
-  --blue: #1f64e9;
+  --bg: #f4f7f4;
+  --surface: #fbfcf8;
+  --text: #0c1414;
+  --muted: #667271;
+  --line: rgba(11, 25, 24, 0.12);
+  --blue: #287f82;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -31,7 +31,7 @@ body {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 24px 70px rgba(31, 48, 78, 0.12);
+  box-shadow: 0 24px 70px rgba(11, 25, 24, 0.12);
 }
 
 .share-brand { display: flex; align-items: center; gap: 9px; margin-bottom: 48px; font-size: 19px; font-weight: 750; }
