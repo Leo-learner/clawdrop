@@ -634,10 +634,16 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.equal(response.headers.get('x-clawdrop-rate-limit-kb'), '100');
     assert.equal(await response.text(), '<script>alert(1)</script>\nhello');
 
-    const detail = await fetch(`${baseUrl}/api/files/${uploadedId}`, {
-      headers: bearer(ADMIN_TOKEN)
-    });
-    assert.equal((await detail.json()).file.downloadCount, 2);
+    let count = -1;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const detail = await fetch(`${baseUrl}/api/files/${uploadedId}`, {
+        headers: bearer(ADMIN_TOKEN)
+      });
+      count = (await detail.json()).file.downloadCount;
+      if (count === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(count, 2);
   });
 
   test('download ticket uses a short-lived one-use cookie bound to one file', async () => {
