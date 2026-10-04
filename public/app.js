@@ -1,6 +1,7 @@
 'use strict';
 
 const TOKEN_KEY = 'clawdrop.ADMIN_TOKEN';
+const NATIVE_DOWNLOAD_THRESHOLD_BYTES = 16 * 1024 * 1024;
 const loginView = document.querySelector('#login-view');
 const appView = document.querySelector('#app-view');
 const loginForm = document.querySelector('#login-form');
@@ -367,6 +368,25 @@ function triggerBrowserDownload(blob, fileName) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function triggerNativeDownload(url, fileName) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+function showNativeDownloadHandoff(file) {
+  clearTimeout(downloadHideTimer);
+  downloadProgressWrap.hidden = false;
+  downloadProgressTitle.textContent = `已请求浏览器下载 ${file.originalName}`;
+  downloadProgress.removeAttribute('value');
+  downloadProgressPercent.textContent = '浏览器中';
+  downloadProgressDetail.textContent = `${formatBytes(file.size)} · 当前下载限速：${currentDownloadRateLimit} KB/s`;
+  setDownloadStatus('请在浏览器下载列表查看进度');
+}
+
 function uploadSelectedFile(file) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -477,6 +497,23 @@ async function downloadFile(file) {
   });
 
   try {
+    if (file.size > NATIVE_DOWNLOAD_THRESHOLD_BYTES) {
+      const downloadPath = `/api/files/${encodeURIComponent(file.id)}/download`;
+      const response = await api(`/api/files/${encodeURIComponent(file.id)}/download-ticket`, {
+        method: 'POST',
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error('无法开始下载');
+      const ticket = await response.json();
+      if (ticket.url !== downloadPath) throw new Error('下载地址无效');
+      if (runId !== downloadRunId) return;
+      triggerNativeDownload(ticket.url, file.originalName);
+      showNativeDownloadHandoff(file);
+      showToast('请在浏览器下载列表查看进度');
+      resetDownloadProgress(4000);
+      return;
+    }
+
     const response = await api(file.downloadUrl, { signal: controller.signal });
     if (!response.ok) throw new Error('下载失败');
     const headerLength = Number(response.headers.get('Content-Length'));

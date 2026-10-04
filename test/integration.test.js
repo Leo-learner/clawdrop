@@ -33,14 +33,14 @@ async function getFreePort() {
   return port;
 }
 
-async function waitForServer() {
+async function waitForServer(url = baseUrl, serverProcess = child) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
-      throw new Error(`server exited before becoming healthy (code ${child.exitCode})`);
+    if (serverProcess.exitCode !== null || serverProcess.signalCode !== null) {
+      throw new Error(`server exited before becoming healthy (code ${serverProcess.exitCode})`);
     }
     try {
-      const response = await fetch(`${baseUrl}/api/health`);
+      const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1000) });
       if (response.ok) return;
     } catch {
       // The process may still be binding its port.
@@ -50,22 +50,129 @@ async function waitForServer() {
   throw new Error('server did not become healthy within 10 seconds');
 }
 
+async function stopServer(serverProcess) {
+  if (serverProcess.exitCode !== null || serverProcess.signalCode !== null) return;
+  await new Promise((resolve) => {
+    const timeout = setTimeout(() => serverProcess.kill('SIGKILL'), 3000);
+    serverProcess.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    serverProcess.kill('SIGTERM');
+  });
+}
+
+async function isolatedServer(overrides = {}, prepare = async () => ({})) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'clawdrop-isolated-test-'));
+  const preparedOverrides = await prepare(root);
+  const port = await getFreePort();
+  const url = `http://127.0.0.1:${port}`;
+  const storageDir = path.join(root, 'storage');
+  const databaseFile = path.join(root, 'data', 'clawdrop.sqlite');
+  const env = {
+    ...process.env,
+    NODE_ENV: 'test',
+    HOST: '127.0.0.1',
+    PORT: String(port),
+    ADMIN_TOKEN,
+    UPLOAD_TOKEN,
+    MAX_FILE_SIZE_MB: '1',
+    MAX_STORAGE_MB: '10240',
+    STORAGE_DIR: storageDir,
+    DATABASE_PATH: databaseFile,
+    PUBLIC_BASE_URL: url
+  };
+  for (const [key, value] of Object.entries({ ...overrides, ...preparedOverrides })) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  const processHandle = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let stderr = '';
+  processHandle.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  processHandle.stdout.resume();
+  try {
+    await waitForServer(url, processHandle);
+  } catch (error) {
+    await stopServer(processHandle);
+    await fs.rm(root, { recursive: true, force: true });
+    throw new Error(`${error.message}\n${stderr}`);
+  }
+  return {
+    url,
+    root,
+    storageDir,
+    databaseFile,
+    get logs() { return stderr; },
+    async close() {
+      await stopServer(processHandle);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  };
+}
+
+async function assertStartupRejected(overrides) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'clawdrop-rejected-test-'));
+  const port = await getFreePort();
+  const env = {
+    ...process.env,
+    NODE_ENV: 'test',
+    HOST: '127.0.0.1',
+    PORT: String(port),
+    ADMIN_TOKEN,
+    UPLOAD_TOKEN,
+    STORAGE_DIR: path.join(root, 'storage'),
+    DATABASE_PATH: path.join(root, 'data', 'clawdrop.sqlite'),
+    ...overrides
+  };
+  const processHandle = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let output = '';
+  processHandle.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  processHandle.stderr.on('data', (chunk) => { output += chunk.toString(); });
+  try {
+    const result = await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(null), 3000);
+      processHandle.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        resolve({ code, signal });
+      });
+    });
+    assert.ok(result, `server unexpectedly stayed up with rejected tokens: ${output}`);
+    assert.notEqual(result.code, 0, `server accepted rejected tokens: ${output}`);
+    assert.match(output, /token/i);
+  } finally {
+    await stopServer(processHandle);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 function bearer(token) {
   return { Authorization: `Bearer ${token}` };
 }
 
-async function upload(name, content, token = UPLOAD_TOKEN) {
+async function uploadAt(url, name, content, token = UPLOAD_TOKEN) {
   const form = new FormData();
   form.append('file', new Blob([content]), name);
-  return fetch(`${baseUrl}/api/upload`, {
+  return fetch(`${url}/api/upload`, {
     method: 'POST',
     headers: bearer(token),
     body: form
   });
 }
 
-async function createShare(fileId, payload = {}) {
-  const response = await fetch(`${baseUrl}/api/files/${fileId}/share`, {
+async function upload(name, content, token = UPLOAD_TOKEN) {
+  return uploadAt(baseUrl, name, content, token);
+}
+
+async function createShareAt(url, fileId, payload = {}) {
+  const response = await fetch(`${url}/api/files/${fileId}/share`, {
     method: 'POST',
     headers: {
       ...bearer(ADMIN_TOKEN),
@@ -75,6 +182,10 @@ async function createShare(fileId, payload = {}) {
   });
   assert.equal(response.status, 201);
   return (await response.json()).share;
+}
+
+async function createShare(fileId, payload = {}) {
+  return createShareAt(baseUrl, fileId, payload);
 }
 
 function updateDatabase(sql, ...params) {
@@ -118,6 +229,7 @@ describe('ClawDrop API', { concurrency: false }, () => {
         ADMIN_TOKEN,
         UPLOAD_TOKEN,
         MAX_FILE_SIZE_MB: '1',
+        MAX_STORAGE_MB: '10240',
         STORAGE_DIR: path.join(tempRoot, 'storage'),
         DATABASE_PATH: databasePath,
         PUBLIC_BASE_URL: baseUrl
@@ -128,16 +240,14 @@ describe('ClawDrop API', { concurrency: false }, () => {
   });
 
   after(async () => {
-    if (child && child.exitCode === null) {
-      child.kill('SIGTERM');
-      await new Promise((resolve) => child.once('exit', resolve));
-    }
+    if (child) await stopServer(child);
     if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
   });
 
   test('health and config endpoints are public and report ready dependencies', async () => {
     const response = await fetch(`${baseUrl}/api/health`);
     assert.equal(response.status, 200);
+    assert.match(response.headers.get('strict-transport-security') || '', /^max-age=\d+/i);
     const body = await response.json();
     assert.equal(body.ok, true);
     assert.equal(body.name, 'clawdrop');
@@ -165,6 +275,74 @@ describe('ClawDrop API', { concurrency: false }, () => {
     });
   });
 
+  test('configured example, short, and shared tokens fail startup; missing tokens stay locked down', async () => {
+    for (const configuration of [
+      { ADMIN_TOKEN: 'change-me-admin-token' },
+      { UPLOAD_TOKEN: 'change-me-upload-token' },
+      { ADMIN_TOKEN: 'too-short' },
+      { UPLOAD_TOKEN: 'too-short' },
+      { ADMIN_TOKEN: UPLOAD_TOKEN }
+    ]) {
+      await assertStartupRejected(configuration);
+    }
+
+    const fixture = await isolatedServer({ ADMIN_TOKEN: undefined, UPLOAD_TOKEN: undefined });
+    try {
+      const health = await fetch(`${fixture.url}/api/health`);
+      assert.equal(health.status, 200);
+      const files = await fetch(`${fixture.url}/api/files`, { headers: bearer(ADMIN_TOKEN) });
+      assert.equal(files.status, 401);
+      const rejectedUpload = await uploadAt(fixture.url, 'locked.txt', 'contents');
+      assert.equal(rejectedUpload.status, 401);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test('health fails when storage stops being writable', async () => {
+    const fixture = await isolatedServer();
+    try {
+      await fs.rmdir(fixture.storageDir);
+      await fs.writeFile(fixture.storageDir, 'not a directory');
+      await new Promise((resolve) => setTimeout(resolve, 1050));
+      const health = await fetch(`${fixture.url}/api/health`);
+      assert.equal(health.status, 503);
+      const body = await health.json();
+      assert.equal(body.ok, false);
+      assert.equal(body.storageReady, false);
+      assert.equal(body.databaseReady, true);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test('server error logs omit query secrets and use only the matched route', async () => {
+    const fixture = await isolatedServer({ NODE_ENV: 'production' });
+    const querySecret = 'never-log-this-query-secret';
+    try {
+      await fs.rmdir(fixture.storageDir);
+      await fs.writeFile(fixture.storageDir, 'not a directory');
+      const form = new FormData();
+      form.append('file', new Blob(['content']), 'error-log.txt');
+      const response = await fetch(`${fixture.url}/api/upload?secret=${querySecret}`, {
+        method: 'POST',
+        headers: bearer(UPLOAD_TOKEN),
+        body: form
+      });
+      assert.equal(response.status, 500);
+      assert.deepEqual(await response.json(), { ok: false, error: 'Internal server error' });
+      const deadline = Date.now() + 2000;
+      while (!fixture.logs.includes('Request failed') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.match(fixture.logs, /Request failed: POST \/api\/upload/);
+      assert.doesNotMatch(fixture.logs, /never-log-this-query-secret/);
+      assert.doesNotMatch(fixture.logs, new RegExp(UPLOAD_TOKEN));
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test('admin endpoints reject missing, wrong, and upload-only tokens', async () => {
     for (const headers of [{}, bearer('wrong-token'), bearer(UPLOAD_TOKEN)]) {
       const response = await fetch(`${baseUrl}/api/files`, { headers });
@@ -190,6 +368,29 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.equal(body.file.downloadUrl, `/api/files/${body.file.id}/download`);
     assert.equal(body.file.previewUrl, `/api/files/${body.file.id}/preview`);
     uploadedId = body.file.id;
+  });
+
+  test('multipart upload accepts exactly one file and no extra fields', async () => {
+    const withField = new FormData();
+    withField.append('file', new Blob(['data']), 'extra-field.txt');
+    withField.append('note', 'unwanted');
+    const withSecondFile = new FormData();
+    withSecondFile.append('file', new Blob(['first']), 'first.txt');
+    withSecondFile.append('file', new Blob(['second']), 'second.txt');
+    const indexedFile = new FormData();
+    indexedFile.append('file[0]', new Blob(['data']), 'indexed.txt');
+
+    for (const form of [withField, withSecondFile, indexedFile]) {
+      const response = await fetch(`${baseUrl}/api/upload`, {
+        method: 'POST',
+        headers: bearer(UPLOAD_TOKEN),
+        body: form
+      });
+      assert.equal(response.status, 400);
+    }
+    const files = await fetch(`${baseUrl}/api/files`, { headers: bearer(ADMIN_TOKEN) });
+    assert.equal((await files.json()).files.length, 1);
+    assert.equal((await fs.readdir(path.join(tempRoot, 'storage'))).length, 1);
   });
 
   test('admin can list and inspect uploaded metadata', async () => {
@@ -307,6 +508,83 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.equal((await fileResponse.json()).file.downloadCount, 1);
   });
 
+  test('share downloads enforce two streams per share and eight streams total', async () => {
+    const fixture = await isolatedServer({ CLAWDROP_RATE_LIMIT_KB: '1' });
+    const activeResponses = [];
+    try {
+      const created = await uploadAt(fixture.url, 'stream-cap.bin', new Uint8Array(32 * 1024));
+      assert.equal(created.status, 201);
+      const fileId = (await created.json()).file.id;
+      const shares = [];
+      for (let index = 0; index < 5; index += 1) {
+        shares.push(await createShareAt(fixture.url, fileId));
+      }
+
+      for (let index = 0; index < 2; index += 1) {
+        const response = await fetch(`${fixture.url}${shares[0].url}/download`);
+        assert.equal(response.status, 200);
+        activeResponses.push(response);
+      }
+      const thirdSameShare = await fetch(`${fixture.url}${shares[0].url}/download`);
+      assert.equal(thirdSameShare.status, 429);
+      await thirdSameShare.arrayBuffer();
+
+      for (let shareIndex = 1; shareIndex < 4; shareIndex += 1) {
+        for (let streamIndex = 0; streamIndex < 2; streamIndex += 1) {
+          const response = await fetch(`${fixture.url}${shares[shareIndex].url}/download`);
+          assert.equal(response.status, 200);
+          activeResponses.push(response);
+        }
+      }
+      assert.equal(activeResponses.length, 8);
+      const ninth = await fetch(`${fixture.url}${shares[4].url}/download`);
+      assert.equal(ninth.status, 429);
+      await ninth.arrayBuffer();
+
+      const listed = await fetch(`${fixture.url}/api/files/${fileId}/shares`, {
+        headers: bearer(ADMIN_TOKEN)
+      });
+      const shareRows = (await listed.json()).shares;
+      assert.equal(shareRows.find((share) => share.id === shares[4].id).downloadCount, 0);
+    } finally {
+      await Promise.allSettled(activeResponses.map((response) => response.body.cancel()));
+      await fixture.close();
+    }
+  });
+
+  test('a share keeps its download count once the client receives bytes and disconnects', async () => {
+    const fixture = await isolatedServer({ CLAWDROP_RATE_LIMIT_KB: '1' });
+    try {
+      const created = await uploadAt(fixture.url, 'partial.bin', new Uint8Array(32 * 1024));
+      assert.equal(created.status, 201);
+      const fileId = (await created.json()).file.id;
+      const share = await createShareAt(fixture.url, fileId, { maxDownloads: 1 });
+
+      const response = await fetch(`${fixture.url}${share.url}/download`);
+      assert.equal(response.status, 200);
+      const reader = response.body.getReader();
+      const firstChunk = await reader.read();
+      assert.equal(firstChunk.done, false);
+      assert.ok(firstChunk.value.byteLength > 0);
+      await reader.cancel();
+
+      const retry = await fetch(`${fixture.url}${share.url}/download`);
+      assert.equal(retry.status, 410);
+      assert.match(await retry.text(), /下载次数已用完/);
+
+      const shareList = await fetch(`${fixture.url}/api/files/${fileId}/shares`, {
+        headers: bearer(ADMIN_TOKEN)
+      });
+      assert.equal((await shareList.json()).shares[0].downloadCount, 1);
+      const detail = await fetch(`${fixture.url}/api/files/${fileId}`, {
+        headers: bearer(ADMIN_TOKEN)
+      });
+      assert.equal((await detail.json()).file.downloadCount, 1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test('HTML preview is forced to plain text and cannot be sniffed', async () => {
     const response = await fetch(`${baseUrl}/api/files/${uploadedId}/preview`, {
       headers: bearer(ADMIN_TOKEN)
@@ -315,6 +593,30 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.match(response.headers.get('content-type'), /^text\/plain/);
     assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(await response.text(), '<script>alert(1)</script>\nhello');
+  });
+
+  test('preview encodes a Unicode filename with RFC 5987', async () => {
+    const name = '中文 报告.txt';
+    const created = await upload(name, '报告正文');
+    assert.equal(created.status, 201);
+    const fileId = (await created.json()).file.id;
+    try {
+      const preview = await fetch(`${baseUrl}/api/files/${fileId}/preview`, {
+        headers: bearer(ADMIN_TOKEN)
+      });
+      assert.equal(preview.status, 200);
+      const disposition = preview.headers.get('content-disposition') || '';
+      assert.match(disposition, /^inline;/);
+      assert.match(disposition, /filename\*=UTF-8''/i);
+      assert.ok(disposition.includes(encodeURIComponent(name)));
+      assert.equal(await preview.text(), '报告正文');
+    } finally {
+      const deleted = await fetch(`${baseUrl}/api/files/${fileId}`, {
+        method: 'DELETE',
+        headers: bearer(ADMIN_TOKEN)
+      });
+      assert.equal(deleted.status, 200);
+    }
   });
 
   test('download is authenticated, uses an attachment, and increments its count', async () => {
@@ -336,6 +638,61 @@ describe('ClawDrop API', { concurrency: false }, () => {
       headers: bearer(ADMIN_TOKEN)
     });
     assert.equal((await detail.json()).file.downloadCount, 2);
+  });
+
+  test('download ticket uses a short-lived one-use cookie bound to one file', async () => {
+    for (const headers of [{}, bearer(UPLOAD_TOKEN)]) {
+      const denied = await fetch(`${baseUrl}/api/files/${uploadedId}/download-ticket`, {
+        method: 'POST',
+        headers
+      });
+      assert.equal(denied.status, 401);
+    }
+
+    const created = await fetch(`${baseUrl}/api/files/${uploadedId}/download-ticket`, {
+      method: 'POST',
+      headers: bearer(ADMIN_TOKEN)
+    });
+    assert.equal(created.status, 200);
+    const ticket = await created.json();
+    assert.equal(ticket.ok, true);
+    const ticketUrl = new URL(ticket.url, baseUrl);
+    assert.equal(ticketUrl.origin, baseUrl);
+    assert.equal(ticketUrl.pathname, `/api/files/${uploadedId}/download`);
+    assert.equal(ticketUrl.search, '');
+    const setCookie = created.headers.get('set-cookie') || '';
+    assert.match(setCookie, /;\s*HttpOnly\b/i);
+    assert.match(setCookie, /;\s*SameSite=Strict\b/i);
+    assert.match(setCookie, /;\s*(?:Max-Age=\d+|Expires=)/i);
+    const cookie = setCookie.split(';', 1)[0];
+    assert.match(cookie, /^[^=]+=.+$/);
+
+    const otherUpload = await upload('other-ticket-file.txt', 'other file');
+    assert.equal(otherUpload.status, 201);
+    const otherId = (await otherUpload.json()).file.id;
+    try {
+      const wrongFile = await fetch(`${baseUrl}/api/files/${otherId}/download`, {
+        headers: { Cookie: cookie }
+      });
+      assert.equal(wrongFile.status, 401);
+
+      const first = await fetch(ticketUrl, { headers: { Cookie: cookie } });
+      assert.equal(first.status, 200);
+      assert.equal(await first.text(), '<script>alert(1)</script>\nhello');
+
+      const reused = await fetch(ticketUrl, { headers: { Cookie: cookie } });
+      assert.equal(reused.status, 401);
+
+      const bearerDownload = await fetch(ticketUrl, { headers: bearer(ADMIN_TOKEN) });
+      assert.equal(bearerDownload.status, 200);
+      await bearerDownload.arrayBuffer();
+    } finally {
+      const removed = await fetch(`${baseUrl}/api/files/${otherId}`, {
+        method: 'DELETE',
+        headers: bearer(ADMIN_TOKEN)
+      });
+      assert.equal(removed.status, 200);
+    }
   });
 
   test('share download stops exactly at maxDownloads', async () => {
@@ -441,6 +798,78 @@ describe('ClawDrop API', { concurrency: false }, () => {
     });
   });
 
+  test('storage quota rejects an upload with 507 and frees capacity after deletion', async () => {
+    const fixture = await isolatedServer({ MAX_STORAGE_MB: '0.001' });
+    try {
+      const first = await uploadAt(fixture.url, 'first.bin', new Uint8Array(600));
+      assert.equal(first.status, 201);
+      const firstId = (await first.json()).file.id;
+
+      const overQuota = await uploadAt(fixture.url, 'over-quota.bin', new Uint8Array(600));
+      assert.equal(overQuota.status, 507);
+      const list = await fetch(`${fixture.url}/api/files`, { headers: bearer(ADMIN_TOKEN) });
+      assert.equal((await list.json()).files.length, 1);
+      assert.equal((await fs.readdir(fixture.storageDir)).length, 1);
+
+      const removed = await fetch(`${fixture.url}/api/files/${firstId}`, {
+        method: 'DELETE',
+        headers: bearer(ADMIN_TOKEN)
+      });
+      assert.equal(removed.status, 200);
+      const retry = await uploadAt(fixture.url, 'retry.bin', new Uint8Array(600));
+      assert.equal(retry.status, 201);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test('a held multipart upload makes a simultaneous upload return 429', async () => {
+    const fixture = await isolatedServer();
+    const boundary = 'clawdrop-held-upload-boundary';
+    const encoder = new TextEncoder();
+    let finishRequest;
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="held.txt"\r\nContent-Type: text/plain\r\n\r\nheld`
+        ));
+        finishRequest = () => {
+          controller.enqueue(encoder.encode(`\r\n--${boundary}--\r\n`));
+          controller.close();
+        };
+      }
+    });
+    let firstRequest;
+    try {
+      firstRequest = fetch(`${fixture.url}/api/upload`, {
+        method: 'POST',
+        headers: {
+          ...bearer(UPLOAD_TOKEN),
+          'Content-Type': `multipart/form-data; boundary=${boundary}`
+        },
+        body,
+        duplex: 'half'
+      });
+      firstRequest.catch(() => {});
+
+      const deadline = Date.now() + 5000;
+      while ((await fs.readdir(fixture.storageDir)).length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal((await fs.readdir(fixture.storageDir)).length, 1, 'first upload never reached storage');
+      const simultaneous = await uploadAt(fixture.url, 'simultaneous.txt', 'second');
+      assert.equal(simultaneous.status, 429);
+    } finally {
+      finishRequest();
+      if (firstRequest) {
+        const completed = await firstRequest;
+        assert.equal(completed.status, 201);
+        await completed.arrayBuffer();
+      }
+      await fixture.close();
+    }
+  });
+
   test('invalid IDs return a path-safe 404', async () => {
     const response = await fetch(`${baseUrl}/api/files/not-a-valid-id`, {
       headers: bearer(ADMIN_TOKEN)
@@ -543,6 +972,28 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.ok(Date.parse(revoked.revokedAt));
     const storedFiles = await fs.readdir(path.join(tempRoot, 'storage'));
     assert.deepEqual(storedFiles, []);
+  });
+
+  test('delete revokes metadata and shares when the disk file is already missing', async () => {
+    const created = await upload('missing-on-disk.txt', 'metadata survives');
+    assert.equal(created.status, 201);
+    const fileId = (await created.json()).file.id;
+    const share = await createShare(fileId);
+    const database = new Database(databasePath, { readonly: true });
+    const storedName = database.prepare('SELECT stored_name FROM files WHERE id = ?').get(fileId).stored_name;
+    database.close();
+    await fs.unlink(path.join(tempRoot, 'storage', storedName));
+
+    const deleted = await fetch(`${baseUrl}/api/files/${fileId}`, {
+      method: 'DELETE',
+      headers: bearer(ADMIN_TOKEN)
+    });
+    assert.equal(deleted.status, 200);
+    assert.deepEqual(await deleted.json(), { ok: true });
+    assert.equal((await fetch(`${baseUrl}/api/files/${fileId}`, {
+      headers: bearer(ADMIN_TOKEN)
+    })).status, 404);
+    assert.equal((await fetch(`${baseUrl}${share.url}`)).status, 404);
   });
 
   test('static app is served with a restrictive content security policy', async () => {

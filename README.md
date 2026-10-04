@@ -9,7 +9,7 @@ ClawDrop 是一个可部署到云服务器上的轻量私人云文件传输 / �
 - 保留 v1 文件上传、列表、详情、安全预览、下载和软删除 API
 - `UPLOAD_TOKEN` 与 `ADMIN_TOKEN` 严格分权
 - 浏览器管理页支持选择文件上传、上传进度、完成后自动刷新文件列表
-- 管理页下载使用浏览器流式读取显示进度，适合默认限速下的大文件下载
+- 管理页对不超过 16 MiB 的文件显示页面内下载进度；更大的文件交给浏览器下载列表，避免页面累积整份文件
 - 管理员下载和公开分享下载默认限速 `100 KB/s`，可通过 `CLAWDROP_RATE_LIMIT_KB` 调整
 - 临时分享链接：有效期 1–168 小时、可限制 1–100 次下载、可随时撤销
 - 分享页面无需管理 token，只展示并下载一个指定文件
@@ -50,7 +50,7 @@ npm start
 
 浏览器打开 `http://localhost:3010`，输入 `.env` 中的 `ADMIN_TOKEN`。首次运行会自动创建 `data/`、`storage/` 和数据库表。
 
-没有 `.env` 时服务仍可启动，但受保护接口会拒绝请求。示例 token、短 token 或两个 token 相同时，启动日志会显示安全警告，但不会打印 token 内容。
+没有 `.env` 时服务仍可启动，但受保护接口会拒绝请求。若已配置示例 token、少于 32 字符的 token，或两个 token 相同，服务会拒绝启动，错误信息不会打印 token 内容。
 
 临时覆盖下载限速可直接在启动命令前设置环境变量：
 
@@ -67,6 +67,7 @@ CLAWDROP_RATE_LIMIT_KB=500 npm start
 | `UPLOAD_TOKEN` | 无 | 只允许上传文件 |
 | `ADMIN_TOKEN` | 无 | 允许文件和分享链接管理 |
 | `MAX_FILE_SIZE_MB` | `200` | 单文件上限（MB） |
+| `MAX_STORAGE_MB` | `10240` | 上传目录内所有普通文件的总容量上限（MB），包括未登记的遗留文件 |
 | `CLAWDROP_RATE_LIMIT_KB` | `100` | 下载限速，单位 KB/s；只影响文件下载，不影响页面和 API 列表 |
 | `STORAGE_DIR` | `storage` | 文件目录；相对路径以项目目录为基准 |
 | `DATABASE_PATH` | `data/clawdrop.sqlite` | SQLite 路径 |
@@ -82,15 +83,19 @@ CLAWDROP_RATE_LIMIT_KB=500 npm start
 - 默认上传目录是 `storage/`，可用 `STORAGE_DIR=/path/to/uploads` 改到代码目录之外。
 - 上传文件使用随机 UUID 作为磁盘文件名，原始文件名只保存在 SQLite 元数据里。
 - `.gitignore` 已忽略 `storage/`，避免真实上传文件进入仓库。
+- 上传请求只能包含一个名为 `file` 的文件分段，不接受额外文本字段；同时只处理一个上传。并发上传返回 `429`，超过总容量或 10000 个文件返回 `507`。
+- 上传完成后会重新核对目录用量；超出配额的文件会删除，不会进入文件列表。部署多个服务进程时需要在进程外统一限制上传。
 - 下载限速默认 `100 KB/s`，可设置 `CLAWDROP_RATE_LIMIT_KB=500 npm start` 改为 `500 KB/s`。
 - 限速使用 Node.js 流式下载和 Transform 节流实现，不会一次性把大文件读入内存，也不会阻塞普通页面访问。
-- 本阶段只实现下载限速；上传限速后续可继续加入，目前上传仍受 `MAX_FILE_SIZE_MB` 约束。
+- 上传仍受单文件大小及目录总容量限制，但未按传输速率限速。
 
 ## 管理页下载进度
 
-管理员在文件列表点击“下载”时，页面会显示当前文件名、下载状态、已下载大小、总大小、百分比和当前下载限速。进度条依赖下载响应的 `Content-Length`；如果代理或浏览器环境无法提供该响应头，页面会退化为不确定进度，只显示已下载大小。
+管理员下载不超过 16 MiB 的文件时，页面会显示文件名、已下载大小、百分比和当前限速。进度条依赖下载响应的 `Content-Length`；如果代理或浏览器环境无法提供该响应头，页面会显示已下载大小。
 
-默认下载限速仍为 `100 KB/s`，可通过 `CLAWDROP_RATE_LIMIT_KB` 调整。当前版本仅管理员管理页下载有进度条；公开分享页下载仍使用浏览器默认下载行为，后续可在不重构分享页的前提下补充进度 UI。
+大于 16 MiB 的文件会先获取 60 秒有效、只能使用一次且仅限该文件的下载许可，然后由浏览器原生下载。许可保存在 HttpOnly、SameSite=Strict Cookie 中，不出现在 URL。页面会提示在浏览器下载列表查看进度；服务完成传输后才更新下载次数。
+
+默认下载限速仍为 `100 KB/s`，可通过 `CLAWDROP_RATE_LIMIT_KB` 调整。服务同时最多处理 8 条下载流，每个公开分享链接最多占用 2 条；超限时返回 `429`。公开分享页使用浏览器默认下载行为。分享下载开始传输后，即使客户端中途断开，也会计入限次下载次数。
 
 ## Mac 本地测试
 
@@ -213,7 +218,8 @@ v1 上传脚本返回的是受 `ADMIN_TOKEN` 保护的下载/预览地址，不�
 | `POST` | `/api/files` | `ADMIN_TOKEN` | 浏览器管理页 multipart 单文件上传，字段名 `file` |
 | `GET` | `/api/files` | `ADMIN_TOKEN` | 文件列表 |
 | `GET` | `/api/files/:id` | `ADMIN_TOKEN` | 文件详情 |
-| `GET` | `/api/files/:id/download` | `ADMIN_TOKEN` | 管理员附件下载 |
+| `GET` | `/api/files/:id/download` | `ADMIN_TOKEN` 或该文件的一次性下载 Cookie | 管理员附件下载 |
+| `POST` | `/api/files/:id/download-ticket` | `ADMIN_TOKEN` | 为浏览器签发单次下载许可 |
 | `GET` | `/api/files/:id/preview` | `ADMIN_TOKEN` | 图片、文本或 PDF 预览 |
 | `DELETE` | `/api/files/:id` | `ADMIN_TOKEN` | 删除实际文件并软删除元数据 |
 | `POST` | `/api/files/:id/share` | `ADMIN_TOKEN` | 创建临时分享链接 |
@@ -233,17 +239,18 @@ Authorization: Bearer <TOKEN>
 
 - 当前版本适合私人网络、VPN、内网或已有反向代理保护的环境使用；公网直接暴露前建议再增加登录认证、HTTPS 和网络层访问控制。
 - `UPLOAD_TOKEN` 与 `ADMIN_TOKEN` 应使用不同的至少 32 字符随机值；不要把 `ADMIN_TOKEN` 给 OpenClaw，也不要公开 `UPLOAD_TOKEN`。
-- Token 不写入源码、URL 或日志。管理 token 仅存于浏览器 localStorage；分享 token 只存在于分享 URL，不存入 localStorage。
+- 管理与上传 token 不写入源码、URL 或应用日志。管理 token 存于浏览器 localStorage。分享 token 位于分享 URL 中，反向代理访问日志应避免记录 `/s/` 路径中的 token。
 - 分享 token 使用至少 32 字节密码学随机数，不能由文件 ID 推导，适合短期交付，不应代替长期访问控制。
 - 上传文件使用随机 UUID 存储名；下载、预览、删除均校验安全存储路径。
 - `storage/` 不作为静态目录暴露；所有管理下载经过鉴权，公开分享只定位一个文件。
 - HTML、JavaScript、CSS 按 `text/plain` 预览，并保留 CSP、Referrer-Policy、nosniff 和 X-Frame-Options。
 - 文本预览最多 2 MB，单文件上传默认最多 200 MB。
+- `/api/health` 会测试存储目录与 SQLite 是否可写；不可用时返回 `503`。HTTPS 响应含 180 天 HSTS，不覆盖子域，也不预加载。
 - 如果暴露公网，务必使用强 token、HTTPS、严格防火墙规则，并建议使用 Caddy/Nginx 反向代理鉴权或网络层访问控制。
 
 ## 后续服务器部署提示
 
-本仓库代码可后续拉取到 Azure Ubuntu 等云服务器运行。正式部署前建议准备强随机 `.env`、独立 `STORAGE_DIR`、进程守护、HTTPS 反向代理、访问日志轮转和备份策略。本阶段不包含服务器连接、Nginx 修改、HTTPS 申请或部署操作。
+部署到 Azure Ubuntu 等云服务器时，应准备强随机 `.env`、独立 `STORAGE_DIR`、进程守护、HTTPS 反向代理、访问日志轮转和备份策略。更新时先在本地验证，再推送准确提交，备份生产数据并部署同一提交，最后核对 HTTPS 健康接口。
 
 ## 后续可选优化
 

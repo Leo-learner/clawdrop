@@ -7,6 +7,7 @@ const path = require('node:path');
 const { Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const Database = require('better-sqlite3');
+const contentDisposition = require('content-disposition');
 const dotenv = require('dotenv');
 const express = require('express');
 const mime = require('mime-types');
@@ -26,6 +27,16 @@ const MAX_FILE_SIZE_MB = Number.isFinite(parsedMaxFileSize) && parsedMaxFileSize
   ? parsedMaxFileSize
   : 200;
 const MAX_FILE_SIZE_BYTES = Math.floor(MAX_FILE_SIZE_MB * 1024 * 1024);
+const parsedMaxStorage = Number.parseFloat(process.env.MAX_STORAGE_MB || '10240');
+const MAX_STORAGE_MB = Number.isFinite(parsedMaxStorage) && parsedMaxStorage > 0
+  ? parsedMaxStorage
+  : 10240;
+const MAX_STORAGE_BYTES = Math.floor(MAX_STORAGE_MB * 1024 * 1024);
+const MAX_STORED_FILES = 10000;
+const MAX_ACTIVE_DOWNLOADS = 8;
+const MAX_ACTIVE_SHARE_DOWNLOADS = 2;
+const DOWNLOAD_TICKET_LIFETIME_MS = 60 * 1000;
+const MAX_DOWNLOAD_TICKETS = 1000;
 const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.trim() || '';
 const AUTO_CLEANUP_ENABLED = /^true$/i.test(process.env.AUTO_CLEANUP_ENABLED || 'false');
@@ -86,22 +97,23 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_share_links_token ON share_links(token);
   CREATE INDEX IF NOT EXISTS idx_share_links_file_id ON share_links(file_id);
   CREATE INDEX IF NOT EXISTS idx_share_links_expires_at ON share_links(expires_at);
+  CREATE TABLE IF NOT EXISTS health_probes (
+    id INTEGER PRIMARY KEY
+  );
 `);
 
-function warnAboutToken(name, value, defaultValue) {
+function validateToken(name, value, defaultValue) {
   if (!value) {
     console.warn(`[security] ${name} is not configured; its protected endpoints will reject all requests.`);
-  } else if (value === defaultValue) {
-    console.warn(`[security] ${name} still uses the example value. Replace it before deployment.`);
-  } else if (value.length < 32) {
-    console.warn(`[security] ${name} is short. Use a random token of at least 32 characters.`);
+  } else if (value === defaultValue || value.length < 32) {
+    throw new Error(`[security] ${name} must be a non-example random token of at least 32 characters.`);
   }
 }
 
-warnAboutToken('UPLOAD_TOKEN', UPLOAD_TOKEN, DEFAULT_UPLOAD_TOKEN);
-warnAboutToken('ADMIN_TOKEN', ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN);
+validateToken('UPLOAD_TOKEN', UPLOAD_TOKEN, DEFAULT_UPLOAD_TOKEN);
+validateToken('ADMIN_TOKEN', ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN);
 if (UPLOAD_TOKEN && ADMIN_TOKEN && UPLOAD_TOKEN === ADMIN_TOKEN) {
-  console.warn('[security] UPLOAD_TOKEN and ADMIN_TOKEN are identical. Use separate values.');
+  throw new Error('[security] UPLOAD_TOKEN and ADMIN_TOKEN must be different.');
 }
 
 function tokensMatch(received, expected) {
@@ -140,6 +152,7 @@ function safeStoredPath(storedName) {
 }
 
 const upload = multer({
+  defParamCharset: 'utf8',
   storage: multer.diskStorage({
     destination: (_req, _file, callback) => callback(null, STORAGE_DIR),
     filename: (_req, file, callback) => {
@@ -150,7 +163,14 @@ const upload = multer({
   }),
   limits: {
     files: 1,
-    fileSize: MAX_FILE_SIZE_BYTES
+    fileSize: MAX_FILE_SIZE_BYTES,
+    fields: 0,
+    parts: 1,
+    fieldNameSize: 100,
+    fieldSize: 0,
+    fieldNestingDepth: 0,
+    fieldArrayIndexLimit: 0,
+    headerPairs: 32
   }
 });
 
@@ -369,6 +389,57 @@ function createDownloadThrottle(bytesPerSecond) {
   });
 }
 
+let activeDownloads = 0;
+const activeShareDownloads = new Map();
+function reserveDownload(shareId = null) {
+  const shareCount = shareId ? (activeShareDownloads.get(shareId) || 0) : 0;
+  if (activeDownloads >= MAX_ACTIVE_DOWNLOADS
+      || (shareId && shareCount >= MAX_ACTIVE_SHARE_DOWNLOADS)) {
+    return null;
+  }
+  activeDownloads += 1;
+  if (shareId) activeShareDownloads.set(shareId, shareCount + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeDownloads -= 1;
+    if (shareId) {
+      const remaining = activeShareDownloads.get(shareId) - 1;
+      if (remaining) activeShareDownloads.set(shareId, remaining);
+      else activeShareDownloads.delete(shareId);
+    }
+  };
+}
+
+const downloadTickets = new Map();
+function pruneDownloadTickets() {
+  const now = Date.now();
+  for (const [token, ticket] of downloadTickets) {
+    if (ticket.expiresAt <= now) downloadTickets.delete(token);
+  }
+}
+
+function redeemDownloadTicket(req) {
+  const cookies = (req.get('cookie') || '').split(';');
+  for (const cookie of cookies) {
+    const [name, token] = cookie.trim().split('=', 2);
+    if (name !== 'clawdrop_download' || !/^[A-Za-z0-9_-]{43}$/.test(token || '')) continue;
+    const ticket = downloadTickets.get(token);
+    if (!ticket || ticket.fileId !== req.params.id || ticket.expiresAt <= Date.now()) continue;
+    downloadTickets.delete(token);
+    return true;
+  }
+  return false;
+}
+
+function requireDownloadAccess(req, res, next) {
+  const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') || '');
+  if (match && tokensMatch(match[1], ADMIN_TOKEN)) return next();
+  if (req.method === 'GET' && redeemDownloadTicket(req)) return next();
+  return res.status(401).json({ ok: false, error: 'Unauthorized' });
+}
+
 async function sendRateLimitedDownload(req, res, next, {
   filePath,
   originalName,
@@ -378,6 +449,7 @@ async function sendRateLimitedDownload(req, res, next, {
   try {
     const stats = await fsp.stat(filePath);
     if (!stats.isFile()) {
+      if (onFailure) onFailure();
       if (!res.headersSent) res.status(404).json({ ok: false, error: 'File not found' });
       return;
     }
@@ -386,6 +458,7 @@ async function sendRateLimitedDownload(req, res, next, {
     res.type(mime.lookup(originalName) || 'application/octet-stream');
     res.set({
       'Accept-Ranges': 'none',
+      'Cache-Control': 'no-store',
       'Content-Length': String(stats.size),
       'X-ClawDrop-Rate-Limit-KB': formatRateLimitKb(DOWNLOAD_RATE_LIMIT_KB)
     });
@@ -402,7 +475,8 @@ async function sendRateLimitedDownload(req, res, next, {
       return;
     }
     if (!res.headersSent) {
-      next(error);
+      if (error?.code === 'ENOENT') res.status(404).json({ ok: false, error: 'File not found' });
+      else next(error);
     }
   }
 }
@@ -466,6 +540,75 @@ async function fileExists(filePath) {
   }
 }
 
+async function storageUsage() {
+  let bytes = 0;
+  let files = 0;
+  for await (const entry of await fsp.opendir(STORAGE_DIR)) {
+    if (!entry.isFile()) continue;
+    try {
+      const stats = await fsp.stat(path.join(STORAGE_DIR, entry.name));
+      bytes += stats.size;
+      files += 1;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  return { bytes, files };
+}
+
+async function storageWritable() {
+  const probePath = path.join(STORAGE_DIR, `.health-${crypto.randomUUID()}`);
+  let handle;
+  try {
+    handle = await fsp.open(probePath, 'wx', 0o600);
+    await handle.writeFile('ok');
+    await handle.close();
+    handle = null;
+    await fsp.unlink(probePath);
+    return true;
+  } catch {
+    if (handle) await handle.close().catch(() => {});
+    await fsp.unlink(probePath).catch(() => {});
+    return false;
+  }
+}
+
+function databaseWritable() {
+  let transactionOpen = false;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    transactionOpen = true;
+    db.prepare('INSERT INTO health_probes DEFAULT VALUES').run();
+    db.exec('ROLLBACK');
+    transactionOpen = false;
+    return true;
+  } catch {
+    if (transactionOpen) {
+      try { db.exec('ROLLBACK'); } catch { /* Keep health unavailable. */ }
+    }
+    return false;
+  }
+}
+
+let lastReadiness = null;
+let readinessCheckedAt = 0;
+let readinessInFlight = null;
+function checkReadiness() {
+  if (lastReadiness && Date.now() - readinessCheckedAt < 1000) {
+    return Promise.resolve(lastReadiness);
+  }
+  if (!readinessInFlight) {
+    readinessInFlight = (async () => {
+      const storageReady = await storageWritable();
+      const databaseReady = databaseWritable();
+      lastReadiness = { storageReady, databaseReady };
+      readinessCheckedAt = Date.now();
+      return lastReadiness;
+    })().finally(() => { readinessInFlight = null; });
+  }
+  return readinessInFlight;
+}
+
 async function runCleanup({ olderThanDays, dryRun }) {
   const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
   const files = listFilesOlderThan.all(cutoff);
@@ -498,28 +641,56 @@ async function runCleanup({ olderThanDays, dryRun }) {
   return result;
 }
 
-function handleUpload(req, res, next) {
-  upload.single('file')(req, res, async (uploadError) => {
-    if (uploadError) {
-      if (uploadError instanceof multer.MulterError && uploadError.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({
-          ok: false,
-          error: `File exceeds the ${MAX_FILE_SIZE_MB} MB limit`
-        });
-      }
-      return res.status(400).json({ ok: false, error: 'Invalid file upload' });
-    }
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: 'A single file field named "file" is required' });
-    }
+let activeUpload = null;
+async function handleUpload(req, res, next) {
+  if (activeUpload) {
+    return res.status(429).json({ ok: false, error: 'Another upload is in progress' });
+  }
+  const uploadSlot = Symbol('upload');
+  activeUpload = uploadSlot;
+  const releaseUpload = () => {
+    if (activeUpload === uploadSlot) activeUpload = null;
+  };
+  res.once('close', releaseUpload);
 
-    const filePath = safeStoredPath(req.file.filename);
-    if (!filePath) {
-      await fsp.unlink(req.file.path).catch(() => {});
-      return res.status(400).json({ ok: false, error: 'Invalid stored file name' });
+  try {
+    const used = await storageUsage();
+    if (used.bytes >= MAX_STORAGE_BYTES || used.files >= MAX_STORED_FILES) {
+      releaseUpload();
+      return res.status(507).json({ ok: false, error: 'Storage quota exceeded' });
     }
+  } catch (error) {
+    releaseUpload();
+    return next(error);
+  }
 
+  return upload.single('file')(req, res, async (uploadError) => {
     try {
+      if (uploadError) {
+        if (uploadError instanceof multer.MulterError && uploadError.code === 'LIMIT_FILE_SIZE') {
+          return res.status(413).json({
+            ok: false,
+            error: `File exceeds the ${MAX_FILE_SIZE_MB} MB limit`
+          });
+        }
+        return res.status(400).json({ ok: false, error: 'Invalid file upload' });
+      }
+      if (!req.file) {
+        return res.status(400).json({ ok: false, error: 'A single file field named "file" is required' });
+      }
+
+      const filePath = safeStoredPath(req.file.filename);
+      if (!filePath) {
+        await fsp.unlink(req.file.path).catch(() => {});
+        return res.status(400).json({ ok: false, error: 'Invalid stored file name' });
+      }
+
+      const used = await storageUsage();
+      if (used.bytes > MAX_STORAGE_BYTES || used.files > MAX_STORED_FILES) {
+        await fsp.unlink(filePath).catch(() => {});
+        return res.status(507).json({ ok: false, error: 'Storage quota exceeded' });
+      }
+
       const originalName = normalizeOriginalName(req.file.originalname);
       const record = {
         id: req.file.clawdropId,
@@ -534,8 +705,10 @@ function handleUpload(req, res, next) {
       insertFile.run(record);
       return res.status(201).json({ ok: true, file: publicFile(record) });
     } catch (error) {
-      await fsp.unlink(filePath).catch(() => {});
+      if (req.file?.path) await fsp.unlink(req.file.path).catch(() => {});
       return next(error);
+    } finally {
+      releaseUpload();
     }
   });
 }
@@ -546,6 +719,7 @@ app.use((_req, res, next) => {
   res.set({
     'Content-Security-Policy': "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' blob: data:; frame-src blob:; script-src 'self'; style-src 'self'; connect-src 'self'",
     'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': 'max-age=15552000',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY'
   });
@@ -554,14 +728,8 @@ app.use((_req, res, next) => {
 app.use(express.json({ limit: '16kb' }));
 
 app.get('/api/health', async (_req, res) => {
-  const storageReady = await fileExists(STORAGE_DIR);
-  let databaseReady = false;
-  try {
-    databaseReady = db.prepare('SELECT 1 AS ready').get().ready === 1;
-  } catch {
-    databaseReady = false;
-  }
-  res.json({
+  const { storageReady, databaseReady } = await checkReadiness();
+  res.status(storageReady && databaseReady ? 200 : 503).json({
     ok: storageReady && databaseReady,
     name: 'clawdrop',
     time: new Date().toISOString(),
@@ -603,6 +771,34 @@ app.get('/api/files/:id', requireAdminToken, (req, res) => {
   const file = getActiveFile.get(req.params.id);
   if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
   return res.json({ ok: true, file: publicFile(file) });
+});
+
+app.post('/api/files/:id/download-ticket', requireAdminToken, async (req, res) => {
+  const file = getActiveFile.get(req.params.id);
+  const filePath = file && safeStoredPath(file.storedName);
+  if (!file || !filePath || !(await fileExists(filePath))) {
+    return res.status(404).json({ ok: false, error: 'File not found' });
+  }
+
+  pruneDownloadTickets();
+  if (downloadTickets.size >= MAX_DOWNLOAD_TICKETS) {
+    return res.status(429).json({ ok: false, error: 'Too many pending downloads' });
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  const url = `/api/files/${file.id}/download`;
+  downloadTickets.set(token, {
+    fileId: file.id,
+    expiresAt: Date.now() + DOWNLOAD_TICKET_LIFETIME_MS
+  });
+  const localHost = ['localhost', '127.0.0.1', '::1'].includes(req.hostname);
+  res.cookie('clawdrop_download', token, {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: PUBLIC_BASE_URL.startsWith('https://') || !localHost,
+    path: url,
+    maxAge: DOWNLOAD_TICKET_LIFETIME_MS
+  });
+  return res.set('Cache-Control', 'no-store').json({ ok: true, url });
 });
 
 app.post('/api/files/:id/share', requireAdminToken, (req, res) => {
@@ -714,41 +910,55 @@ app.get('/s/:token/download', async (req, res, next) => {
     return sendSharePage(res, { statusCode: 404, title: '分享文件不可用', message: '文件已被删除或暂时无法访问。' });
   }
 
-  const claimed = claimShareDownload(token);
-  if (claimed.availability !== 'active') {
-    const messages = {
-      missing: ['分享链接不存在', '这个分享链接无效，或对应文件已不可用。'],
-      revoked: ['链接已失效', '分享者已撤销这个链接。'],
-      expired: ['链接已过期', '这个临时分享已超过有效期。'],
-      limited: ['下载次数已用完', '这个分享链接已达到下载次数上限。']
-    };
-    const [title, message] = messages[claimed.availability];
-    return sendSharePage(res, { statusCode: claimed.availability === 'missing' ? 404 : 410, title, message });
+  const releaseSlot = reserveDownload(initialShare.id);
+  if (!releaseSlot) {
+    return res.status(429).json({ ok: false, error: 'Too many active downloads' });
   }
-
-  return sendRateLimitedDownload(req, res, next, {
-    filePath,
-    originalName: claimed.share.originalName,
-    onFailure: () => {
-      releaseShareDownload(claimed.share);
+  try {
+    const claimed = claimShareDownload(token);
+    if (claimed.availability !== 'active') {
+      const messages = {
+        missing: ['分享链接不存在', '这个分享链接无效，或对应文件已不可用。'],
+        revoked: ['链接已失效', '分享者已撤销这个链接。'],
+        expired: ['链接已过期', '这个临时分享已超过有效期。'],
+        limited: ['下载次数已用完', '这个分享链接已达到下载次数上限。']
+      };
+      const [title, message] = messages[claimed.availability];
+      return sendSharePage(res, { statusCode: claimed.availability === 'missing' ? 404 : 410, title, message });
     }
-  });
+
+    await sendRateLimitedDownload(req, res, next, {
+      filePath,
+      originalName: claimed.share.originalName,
+      onFailure: () => {
+        if (!res.headersSent) releaseShareDownload(claimed.share);
+      }
+    });
+  } finally {
+    releaseSlot();
+  }
 });
 
-app.get('/api/files/:id/download', requireAdminToken, async (req, res, next) => {
+app.get('/api/files/:id/download', requireDownloadAccess, async (req, res, next) => {
   const file = getActiveFile.get(req.params.id);
   const filePath = file && safeStoredPath(file.storedName);
   if (!file || !filePath || !(await fileExists(filePath))) {
     return res.status(404).json({ ok: false, error: 'File not found' });
   }
 
-  return sendRateLimitedDownload(req, res, next, {
-    filePath,
-    originalName: file.originalName,
-    onComplete: () => {
-      incrementDownloadCount.run(file.id);
-    }
-  });
+  const releaseSlot = reserveDownload();
+  if (!releaseSlot) return res.status(429).json({ ok: false, error: 'Too many active downloads' });
+  try {
+    await sendRateLimitedDownload(req, res, next, {
+      filePath,
+      originalName: file.originalName,
+      onComplete: () => {
+        incrementDownloadCount.run(file.id);
+      }
+    });
+  } finally {
+    releaseSlot();
+  }
 });
 
 const imagePreviewTypes = new Map([
@@ -770,8 +980,7 @@ app.get('/api/files/:id/preview', requireAdminToken, async (req, res) => {
   }
 
   const extension = path.extname(file.originalName).toLowerCase();
-  const inlineName = normalizeOriginalName(file.originalName).replace(/["\\]/g, '_');
-  res.set('Content-Disposition', `inline; filename="${inlineName}"`);
+  res.set('Content-Disposition', contentDisposition(normalizeOriginalName(file.originalName), { type: 'inline' }));
 
   if (imagePreviewTypes.has(extension)) {
     res.type(imagePreviewTypes.get(extension));
@@ -798,13 +1007,12 @@ app.delete('/api/files/:id', requireAdminToken, async (req, res, next) => {
     return res.status(404).json({ ok: false, error: 'File not found' });
   }
   try {
-    await fsp.unlink(filePath);
+    await fsp.unlink(filePath).catch((error) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
     softDeleteFileAndShares(new Date().toISOString(), file.id);
     return res.json({ ok: true });
   } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return res.status(404).json({ ok: false, error: 'File not found' });
-    }
     return next(error);
   }
 });
@@ -821,7 +1029,8 @@ app.use('/api', (_req, res) => {
 
 app.use((_error, req, res, _next) => {
   if (process.env.NODE_ENV !== 'test') {
-    console.error(`[error] Request failed: ${req.method} ${req.originalUrl}`);
+    const route = typeof req.route?.path === 'string' ? req.route.path : '<unmatched>';
+    console.error(`[error] Request failed: ${req.method} ${route}`);
   }
   if (!res.headersSent) {
     res.status(500).json({ ok: false, error: 'Internal server error' });
