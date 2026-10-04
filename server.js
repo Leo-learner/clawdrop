@@ -33,6 +33,8 @@ const MAX_STORAGE_MB = Number.isFinite(parsedMaxStorage) && parsedMaxStorage > 0
   : 10240;
 const MAX_STORAGE_BYTES = Math.floor(MAX_STORAGE_MB * 1024 * 1024);
 const MAX_STORED_FILES = 10000;
+const MAX_UPLOAD_REQUESTS_PER_MINUTE = 30;
+const UPLOAD_RATE_WINDOW_MS = 60 * 1000;
 const MAX_ACTIVE_DOWNLOADS = 8;
 const MAX_ACTIVE_SHARE_DOWNLOADS = 2;
 const DOWNLOAD_TICKET_LIFETIME_MS = 60 * 1000;
@@ -135,6 +137,23 @@ function tokenGuard(expectedToken) {
 
 const requireUploadToken = tokenGuard(UPLOAD_TOKEN);
 const requireAdminToken = tokenGuard(ADMIN_TOKEN);
+
+const uploadRequestTimes = new Map();
+function limitUploadRequests(role) {
+  return (_req, res, next) => {
+    const now = Date.now();
+    const recent = (uploadRequestTimes.get(role) || [])
+      .filter((timestamp) => timestamp > now - UPLOAD_RATE_WINDOW_MS);
+    if (recent.length >= MAX_UPLOAD_REQUESTS_PER_MINUTE) {
+      const retryAfter = Math.max(1, Math.ceil((recent[0] + UPLOAD_RATE_WINDOW_MS - now) / 1000));
+      res.set('Retry-After', String(retryAfter));
+      return res.status(429).json({ ok: false, error: 'Upload rate limit exceeded' });
+    }
+    recent.push(now);
+    uploadRequestTimes.set(role, recent);
+    return next();
+  };
+}
 
 function normalizeOriginalName(input) {
   const normalized = String(input || '').replace(/\\/g, '/');
@@ -746,8 +765,8 @@ app.get('/api/config', (_req, res) => {
   });
 });
 
-app.post('/api/upload', requireUploadToken, handleUpload);
-app.post('/api/files', requireAdminToken, handleUpload);
+app.post('/api/upload', requireUploadToken, limitUploadRequests('upload'), handleUpload);
+app.post('/api/files', requireAdminToken, limitUploadRequests('admin'), handleUpload);
 
 app.post('/api/admin/cleanup', requireAdminToken, async (req, res) => {
   const olderThanDays = req.body?.olderThanDays === undefined

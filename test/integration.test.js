@@ -393,6 +393,31 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.equal((await fs.readdir(path.join(tempRoot, 'storage'))).length, 1);
   });
 
+  test('upload token is limited to 30 requests per minute without blocking admin uploads', async () => {
+    const fixture = await isolatedServer();
+    try {
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const response = await uploadAt(fixture.url, `rate-${attempt}.txt`, 'x');
+        assert.equal(response.status, 201);
+      }
+      const limited = await uploadAt(fixture.url, 'rate-limited.txt', 'x');
+      assert.equal(limited.status, 429);
+      assert.equal((await limited.json()).error, 'Upload rate limit exceeded');
+      assert.ok(Number(limited.headers.get('retry-after')) >= 1);
+
+      const adminForm = new FormData();
+      adminForm.append('file', new Blob(['admin upload']), 'admin-after-rate-limit.txt');
+      const adminUpload = await fetch(`${fixture.url}/api/files`, {
+        method: 'POST',
+        headers: bearer(ADMIN_TOKEN),
+        body: adminForm
+      });
+      assert.equal(adminUpload.status, 201);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test('admin can list and inspect uploaded metadata', async () => {
     const list = await fetch(`${baseUrl}/api/files`, { headers: bearer(ADMIN_TOKEN) });
     assert.equal(list.status, 200);
