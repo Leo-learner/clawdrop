@@ -271,7 +271,8 @@ describe('ClawDrop API', { concurrency: false }, () => {
     assert.deepEqual(await config.json(), {
       ok: true,
       maxFileSizeMb: 1,
-      downloadRateLimitKb: 100
+      downloadRateLimitKb: 100,
+      signIn: 'token'
     });
   });
 

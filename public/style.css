@@ -124,6 +124,8 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(90, 213, 218
 
 .privacy-note { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
 .form-error { margin: 16px 0 0; color: var(--danger); font-size: 14px; }
+.clerk-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.clerk-actions .button { display: inline-flex; align-items: center; text-decoration: none; }
 
 .button {
   min-height: 40px;

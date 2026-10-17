@@ -29,6 +29,12 @@
           <p class="privacy-note">Token 只保存在当前浏览器的 localStorage 中。</p>
           <p id="login-error" class="form-error" role="alert" hidden></p>
         </form>
+        <div id="clerk-sign-in" hidden>
+          <div class="clerk-actions">
+            <a id="clerk-account-link" class="button button-primary" href="https://accounts.dkz12345.com/user" target="_blank" rel="noopener" hidden>打开账号设置</a>
+            <button id="clerk-retry" class="button button-primary" type="button" hidden>重新登录</button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -162,6 +168,6 @@
   </dialog>
 
   <div id="toast" class="toast" role="status" hidden></div>
-  <script src="/app.js" defer></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

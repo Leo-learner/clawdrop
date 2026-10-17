@@ -19,7 +19,16 @@ const PROJECT_ROOT = __dirname;
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number.parseInt(process.env.PORT || '3010', 10);
 const UPLOAD_TOKEN = process.env.UPLOAD_TOKEN || '';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+// Shared dkz12345 Clerk sign-in (public values only, no Clerk secret key). When
+// configured, the browser admin is the owner's Clerk account and ADMIN_TOKEN is
+// ignored; UPLOAD_TOKEN keeps working for scripts.
+const CLERK_PUBLISHABLE_KEY = process.env.CLERK_PUBLISHABLE_KEY?.trim() || '';
+const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY_FILE
+  ? fs.readFileSync(process.env.CLERK_JWT_KEY_FILE, 'utf8')
+  : (process.env.CLERK_JWT_KEY || '').replace(/\\n/g, '\n');
+const OWNER_CLERK_USER_ID = process.env.OWNER_CLERK_USER_ID?.trim() || '';
+const CLERK_ENABLED = Boolean(CLERK_PUBLISHABLE_KEY || CLERK_JWT_KEY || OWNER_CLERK_USER_ID);
+const ADMIN_TOKEN = CLERK_ENABLED ? '' : process.env.ADMIN_TOKEN || '';
 const DEFAULT_UPLOAD_TOKEN = 'change-me-upload-token';
 const DEFAULT_ADMIN_TOKEN = 'change-me-admin-token';
 const parsedMaxFileSize = Number.parseFloat(process.env.MAX_FILE_SIZE_MB || '200');
@@ -113,7 +122,14 @@ function validateToken(name, value, defaultValue) {
 }
 
 validateToken('UPLOAD_TOKEN', UPLOAD_TOKEN, DEFAULT_UPLOAD_TOKEN);
-validateToken('ADMIN_TOKEN', ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN);
+if (CLERK_ENABLED) {
+  if (!CLERK_PUBLISHABLE_KEY || !CLERK_JWT_KEY || !OWNER_CLERK_USER_ID.startsWith('user_') || !PUBLIC_BASE_URL) {
+    throw new Error('[security] CLERK_PUBLISHABLE_KEY, CLERK_JWT_KEY(_FILE), OWNER_CLERK_USER_ID and PUBLIC_BASE_URL must be set together.');
+  }
+  if (process.env.ADMIN_TOKEN) console.warn('[security] Clerk sign-in is enabled; ADMIN_TOKEN is ignored.');
+} else {
+  validateToken('ADMIN_TOKEN', ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN);
+}
 if (UPLOAD_TOKEN && ADMIN_TOKEN && UPLOAD_TOKEN === ADMIN_TOKEN) {
   throw new Error('[security] UPLOAD_TOKEN and ADMIN_TOKEN must be different.');
 }
@@ -137,6 +153,40 @@ function tokenGuard(expectedToken) {
 
 const requireUploadToken = tokenGuard(UPLOAD_TOKEN);
 const requireAdminToken = tokenGuard(ADMIN_TOKEN);
+
+// clerk-gate is an ES module; load it once and fail fast on a bad key.
+const clerkGate = CLERK_ENABLED
+  ? import('./lib/clerk-gate/clerk-gate.js').then(({ createClerkGate }) => createClerkGate({
+    publishableKey: CLERK_PUBLISHABLE_KEY,
+    jwtKey: CLERK_JWT_KEY,
+    authorizedParties: [new URL(PUBLIC_BASE_URL).origin]
+  }))
+  : null;
+clerkGate?.catch((error) => {
+  console.error(`[security] Clerk sign-in could not start: ${error.message}`);
+  process.exit(1);
+});
+
+// Admin requests: the owner's Clerk session token, or ADMIN_TOKEN without Clerk.
+// Only the Bearer header counts: the __session cookie rides along on every
+// request to this origin, so accepting it would invite CSRF.
+function requireAdmin(req, res, next) {
+  if (!clerkGate) return requireAdminToken(req, res, next);
+  clerkGate
+    .then((gate) => gate.requireOwner(
+      { authorization: req.get('authorization') },
+      { ownerUserId: OWNER_CLERK_USER_ID, site: 'clawdrop' }
+    ))
+    .then((result) => {
+      if (result.ok) return next();
+      if (result.status === 401) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return res.status(403).json({
+        ok: false,
+        error: 'Forbidden',
+        code: result.reason === 'not-owner' ? 'NOT_OWNER' : 'REAUTH_REQUIRED'
+      });
+    }, next);
+}
 
 const uploadRequestTimes = new Map();
 function limitUploadRequests(role) {
@@ -456,6 +506,7 @@ function requireDownloadAccess(req, res, next) {
   const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') || '');
   if (match && tokensMatch(match[1], ADMIN_TOKEN)) return next();
   if (req.method === 'GET' && redeemDownloadTicket(req)) return next();
+  if (clerkGate && match) return requireAdmin(req, res, next);
   return res.status(401).json({ ok: false, error: 'Unauthorized' });
 }
 
@@ -734,9 +785,16 @@ async function handleUpload(req, res, next) {
 
 const app = express();
 app.disable('x-powered-by');
+// Clerk's script and API, plus Clerk Protect (bot checks) with its worker.
+const CLERK_SOURCES = CLERK_ENABLED ? ' https://clerk.dkz12345.com https://*.protect.clerk.com' : '';
+const CONTENT_SECURITY_POLICY = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' blob: data:; style-src 'self'"
+  + `; frame-src blob:${CLERK_ENABLED ? ' https://*.protect.clerk.com' : ''}`
+  + `; script-src 'self'${CLERK_SOURCES}`
+  + `; connect-src 'self'${CLERK_ENABLED ? ' https://clerk.dkz12345.com https://*.protect.clerk.com:*' : ''}`
+  + (CLERK_ENABLED ? "; worker-src 'self' blob:" : '');
 app.use((_req, res, next) => {
   res.set({
-    'Content-Security-Policy': "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' blob: data:; frame-src blob:; script-src 'self'; style-src 'self'; connect-src 'self'",
+    'Content-Security-Policy': CONTENT_SECURITY_POLICY,
     'Referrer-Policy': 'no-referrer',
     'Strict-Transport-Security': 'max-age=15552000',
     'X-Content-Type-Options': 'nosniff',
@@ -761,14 +819,15 @@ app.get('/api/config', (_req, res) => {
   res.json({
     ok: true,
     maxFileSizeMb: MAX_FILE_SIZE_MB,
-    downloadRateLimitKb: DOWNLOAD_RATE_LIMIT_KB
+    downloadRateLimitKb: DOWNLOAD_RATE_LIMIT_KB,
+    signIn: CLERK_ENABLED ? 'clerk' : 'token'
   });
 });
 
 app.post('/api/upload', requireUploadToken, limitUploadRequests('upload'), handleUpload);
-app.post('/api/files', requireAdminToken, limitUploadRequests('admin'), handleUpload);
+app.post('/api/files', requireAdmin, limitUploadRequests('admin'), handleUpload);
 
-app.post('/api/admin/cleanup', requireAdminToken, async (req, res) => {
+app.post('/api/admin/cleanup', requireAdmin, async (req, res) => {
   const olderThanDays = req.body?.olderThanDays === undefined
     ? AUTO_CLEANUP_DAYS
     : req.body.olderThanDays;
@@ -782,17 +841,17 @@ app.post('/api/admin/cleanup', requireAdminToken, async (req, res) => {
   return res.json(await runCleanup({ olderThanDays, dryRun }));
 });
 
-app.get('/api/files', requireAdminToken, (_req, res) => {
+app.get('/api/files', requireAdmin, (_req, res) => {
   res.json({ ok: true, files: listActiveFiles.all().map(publicFile) });
 });
 
-app.get('/api/files/:id', requireAdminToken, (req, res) => {
+app.get('/api/files/:id', requireAdmin, (req, res) => {
   const file = getActiveFile.get(req.params.id);
   if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
   return res.json({ ok: true, file: publicFile(file) });
 });
 
-app.post('/api/files/:id/download-ticket', requireAdminToken, async (req, res) => {
+app.post('/api/files/:id/download-ticket', requireAdmin, async (req, res) => {
   const file = getActiveFile.get(req.params.id);
   const filePath = file && safeStoredPath(file.storedName);
   if (!file || !filePath || !(await fileExists(filePath))) {
@@ -820,7 +879,7 @@ app.post('/api/files/:id/download-ticket', requireAdminToken, async (req, res) =
   return res.set('Cache-Control', 'no-store').json({ ok: true, url });
 });
 
-app.post('/api/files/:id/share', requireAdminToken, (req, res) => {
+app.post('/api/files/:id/share', requireAdmin, (req, res) => {
   const file = getActiveFile.get(req.params.id);
   if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
 
@@ -853,14 +912,14 @@ app.post('/api/files/:id/share', requireAdminToken, (req, res) => {
   return res.status(201).json({ ok: true, share: publicShare(share, req) });
 });
 
-app.get('/api/files/:id/shares', requireAdminToken, (req, res) => {
+app.get('/api/files/:id/shares', requireAdmin, (req, res) => {
   const file = getActiveFile.get(req.params.id);
   if (!file) return res.status(404).json({ ok: false, error: 'File not found' });
   const shares = listActiveSharesByFile.all(file.id).map((share) => publicShare(share, req));
   return res.json({ ok: true, shares });
 });
 
-app.delete('/api/shares/:id', requireAdminToken, (req, res) => {
+app.delete('/api/shares/:id', requireAdmin, (req, res) => {
   const result = revokeShare.run(new Date().toISOString(), req.params.id);
   if (result.changes === 0) {
     return res.status(404).json({ ok: false, error: 'Share not found' });
@@ -991,7 +1050,7 @@ const textPreviewExtensions = new Set([
   '.txt', '.log', '.md', '.json', '.js', '.css', '.html', '.htm'
 ]);
 
-app.get('/api/files/:id/preview', requireAdminToken, async (req, res) => {
+app.get('/api/files/:id/preview', requireAdmin, async (req, res) => {
   const file = getActiveFile.get(req.params.id);
   const filePath = file && safeStoredPath(file.storedName);
   if (!file || !filePath || !(await fileExists(filePath))) {
@@ -1019,7 +1078,7 @@ app.get('/api/files/:id/preview', requireAdminToken, async (req, res) => {
   return res.status(415).json({ ok: false, error: 'Preview is not supported for this file type' });
 });
 
-app.delete('/api/files/:id', requireAdminToken, async (req, res, next) => {
+app.delete('/api/files/:id', requireAdmin, async (req, res, next) => {
   const file = getActiveFile.get(req.params.id);
   const filePath = file && safeStoredPath(file.storedName);
   if (!file || !filePath) {

@@ -48,7 +48,7 @@ npm test
 npm start
 ```
 
-浏览器打开 `http://localhost:3010`，输入 `.env` 中的 `ADMIN_TOKEN`。首次运行会自动创建 `data/`、`storage/` 和数据库表。
+浏览器打开 `http://localhost:3010`，输入 `.env` 中的 `ADMIN_TOKEN`（配置了 Clerk 时改为跳转到统一账号登录，只有 `OWNER_CLERK_USER_ID` 能进入；Clerk 会话令牌只通过 `Authorization: Bearer` 接受，不认 cookie）。首次运行会自动创建 `data/`、`storage/` 和数据库表。
 
 没有 `.env` 时服务仍可启动，但受保护接口会拒绝请求。若已配置示例 token、少于 32 字符的 token，或两个 token 相同，服务会拒绝启动，错误信息不会打印 token 内容。
 
@@ -66,6 +66,9 @@ CLAWDROP_RATE_LIMIT_KB=500 npm start
 | `HOST` | `0.0.0.0` | 监听地址；仅本机使用可改为 `127.0.0.1` |
 | `UPLOAD_TOKEN` | 无 | 只允许上传文件 |
 | `ADMIN_TOKEN` | 无 | 允许文件和分享链接管理 |
+| `CLERK_PUBLISHABLE_KEY` | 无 | 可选。dkz12345 统一账号（Clerk）的 publishable key；与下面两项一起设置后，网页管理端改用 Clerk 登录，`ADMIN_TOKEN` 不再被接受 |
+| `CLERK_JWT_KEY_FILE` | 无 | Clerk 实例的 JWT 公钥文件（也可用 `CLERK_JWT_KEY` 直接给 PEM）；服务器上不需要 Clerk 私钥 |
+| `OWNER_CLERK_USER_ID` | 无 | 唯一允许管理的 Clerk 用户 id（`user_...`）；会话还需满足 12 小时内完成登录和两步验证 |
 | `MAX_FILE_SIZE_MB` | `200` | 单文件上限（MB） |
 | `MAX_STORAGE_MB` | `10240` | 上传目录内所有普通文件的总容量上限（MB），包括未登记的遗留文件 |
 | `CLAWDROP_RATE_LIMIT_KB` | `100` | 下载限速，单位 KB/s；只影响文件下载，不影响页面和 API 列表 |
