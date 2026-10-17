@@ -1,4 +1,4 @@
-'use strict';
+import { accountPageUrl, getToken as clerkToken, loadClerk, requireSignIn, signOut } from '/vendor/clerk-boot.js';
 
 const TOKEN_KEY = 'clawdrop.ADMIN_TOKEN';
 const NATIVE_DOWNLOAD_THRESHOLD_BYTES = 16 * 1024 * 1024;
@@ -7,6 +7,11 @@ const appView = document.querySelector('#app-view');
 const loginForm = document.querySelector('#login-form');
 const tokenInput = document.querySelector('#admin-token');
 const loginError = document.querySelector('#login-error');
+const loginTitle = document.querySelector('#login-title');
+const loginCopy = document.querySelector('.login-copy');
+const clerkSignIn = document.querySelector('#clerk-sign-in');
+const clerkAccountLink = document.querySelector('#clerk-account-link');
+const clerkRetry = document.querySelector('#clerk-retry');
 const fileList = document.querySelector('#file-list');
 const fileCount = document.querySelector('#file-count');
 const fileSearch = document.querySelector('#file-search');
@@ -56,9 +61,18 @@ let activeDownloadFileId = null;
 let activeDownloadController = null;
 let downloadRunId = 0;
 let currentDownloadRateLimit = '100';
+// 'clerk' when the server signs the owner in with the shared dkz12345 account,
+// 'token' for a self-hosted server that still uses ADMIN_TOKEN.
+let signInMode = 'token';
+let clerk = null;
 
 function getToken() {
   return localStorage.getItem(TOKEN_KEY) || '';
+}
+
+async function authorization() {
+  const token = signInMode === 'clerk' ? await clerkToken().catch(() => null) : getToken();
+  return `Bearer ${token || ''}`;
 }
 
 function closeOpenDialogs() {
@@ -73,6 +87,47 @@ function showLogin(message = '') {
   loginError.hidden = !message;
   loginError.textContent = message;
   if (message) tokenInput.focus();
+}
+
+// The Clerk sign-in states. Signed out goes straight to the account portal; the
+// others explain why the owner check failed and offer the way out.
+function showClerkGate(state) {
+  closeOpenDialogs();
+  appView.hidden = true;
+  loginView.hidden = false;
+  loginForm.hidden = true;
+  clerkSignIn.hidden = false;
+  loginError.hidden = true;
+  const noSecondFactor = clerk?.user?.twoFactorEnabled === false;
+  const copy = {
+    'signed-out': ['打开私有文件箱', '正在前往 dkz12345 统一账号登录…', ''],
+    reauth: noSecondFactor
+      ? ['先开启两步验证', 'ClawDrop 要求登录时经过两步验证，但这个统一账号还没有设置。请在账号设置的「安全」里添加身份验证器 App（或通行密钥），然后重新登录。', '已开启，重新登录']
+      : ['需要重新验证身份', 'ClawDrop 要求 12 小时内完成登录和两步验证。点下面的按钮会退出统一账号，重新登录后回到这里。', '重新登录'],
+    'not-owner': ['这个账号不能打开文件箱', 'ClawDrop 只给主人使用。如果你是主人，请换成你的账号登录。', '换一个账号'],
+    unverified: ['登录状态无法验证', '已登录统一账号，但文件箱暂时无法确认这次登录。请稍后重试。', '重试'],
+    offline: ['登录服务暂时连不上', '无法连接 dkz12345 统一账号服务，请检查网络后重试。', '重试']
+  }[state];
+  [loginTitle.textContent, loginCopy.textContent, clerkRetry.textContent] = copy;
+  clerkRetry.hidden = !copy[2];
+  clerkRetry.dataset.state = state;
+  clerkAccountLink.hidden = !(state === 'reauth' && noSecondFactor);
+  clerkAccountLink.href = accountPageUrl();
+  if (state === 'signed-out') void requireSignIn(location.href);
+}
+
+// The server turned a request away: 401 signed out, 403 failed the owner check.
+function denied(status, code) {
+  if (signInMode !== 'clerk') {
+    localStorage.removeItem(TOKEN_KEY);
+    showLogin('管理 token 错误或已失效');
+  } else if (status === 403) {
+    showClerkGate(code === 'NOT_OWNER' ? 'not-owner' : 'reauth');
+  } else {
+    // Signed in to Clerk yet rejected: sending the owner back to the portal
+    // would bounce straight back here, so stop and say so instead.
+    showClerkGate(clerk?.user ? 'unverified' : 'signed-out');
+  }
 }
 
 function showApp() {
@@ -95,11 +150,13 @@ function showToast(message) {
 
 async function api(requestPath, options = {}) {
   const headers = new Headers(options.headers || {});
-  headers.set('Authorization', `Bearer ${getToken()}`);
+  headers.set('Authorization', await authorization());
   const response = await fetch(requestPath, { ...options, headers });
-  if (response.status === 401) {
-    localStorage.removeItem(TOKEN_KEY);
-    showLogin('管理 token 错误或已失效');
+  const code = response.status === 403
+    ? (await response.clone().json().catch(() => ({}))).code
+    : undefined;
+  if (response.status === 401 || code === 'NOT_OWNER' || code === 'REAUTH_REQUIRED') {
+    denied(response.status, code);
     throw new Error('Unauthorized');
   }
   return response;
@@ -275,6 +332,7 @@ async function loadConfig() {
     if (!response.ok) throw new Error('Config unavailable');
     const config = await response.json();
     currentDownloadRateLimit = formatRateLimit(config.downloadRateLimitKb);
+    if (config.signIn === 'clerk') signInMode = 'clerk';
     rateLimitStatus.textContent = `当前下载限速：${currentDownloadRateLimit} KB/s`;
   } catch {
     currentDownloadRateLimit = '100';
@@ -387,12 +445,13 @@ function showNativeDownloadHandoff(file) {
   setDownloadStatus('请在浏览器下载列表查看进度');
 }
 
-function uploadSelectedFile(file) {
+async function uploadSelectedFile(file) {
+  const auth = await authorization();
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open('POST', '/api/files');
     request.responseType = 'json';
-    request.setRequestHeader('Authorization', `Bearer ${getToken()}`);
+    request.setRequestHeader('Authorization', auth);
     request.upload.addEventListener('progress', (event) => {
       if (event.lengthComputable) {
         setUploadProgress((event.loaded / event.total) * 100);
@@ -402,9 +461,8 @@ function uploadSelectedFile(file) {
     });
     request.addEventListener('load', () => {
       const body = request.response || {};
-      if (request.status === 401) {
-        localStorage.removeItem(TOKEN_KEY);
-        showLogin('管理 token 错误或已失效');
+      if (request.status === 401 || ['NOT_OWNER', 'REAUTH_REQUIRED'].includes(body.code)) {
+        denied(request.status, body.code);
         reject(new Error('Unauthorized'));
         return;
       }
@@ -474,7 +532,7 @@ async function previewFile(file) {
     }
   } catch (error) {
     previewBody.textContent = error.message === 'Unauthorized'
-      ? '管理 token 错误或已失效'
+      ? '登录已失效'
       : error.message;
   }
 }
@@ -819,6 +877,13 @@ document.querySelector('#share-result-copy').addEventListener('click', async () 
 
 document.querySelector('#refresh-button').addEventListener('click', loadFiles);
 document.querySelector('#logout-button').addEventListener('click', () => {
+  if (signInMode === 'clerk') {
+    // One sign-out covers every dkz12345 site, so check first.
+    if (window.confirm('退出会同时退出所有 dkz12345 网站的统一账号。确定退出吗？')) {
+      void signOut(`${location.origin}/`);
+    }
+    return;
+  }
   localStorage.removeItem(TOKEN_KEY);
   currentFiles = [];
   searchQuery = '';
@@ -850,9 +915,23 @@ shareDialog.addEventListener('click', (event) => {
   if (event.target === shareDialog) shareDialog.close();
 });
 
-loadConfig();
+clerkRetry.addEventListener('click', () => {
+  const state = clerkRetry.dataset.state;
+  if (state === 'reauth' || state === 'not-owner') void signOut(location.href);
+  else location.reload();
+});
 
-if (getToken()) {
+await loadConfig();
+
+if (signInMode === 'clerk') {
+  try {
+    clerk = await loadClerk();
+    if (clerk.user) loadFiles();
+    else showClerkGate('signed-out');
+  } catch {
+    showClerkGate('offline');
+  }
+} else if (getToken()) {
   loadFiles();
 } else {
   showLogin();

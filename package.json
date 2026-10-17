@@ -15,6 +15,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@clerk/backend": "3.22.0",
     "better-sqlite3": "^12.4.1",
     "content-disposition": "^1.1.0",
     "dotenv": "^17.2.3",
